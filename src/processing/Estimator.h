@@ -37,7 +37,7 @@ struct IMUData {
 };
 
 /**
- * @brief Tracking state enumeration (ORB-SLAM3 style)
+ * @brief Tracking state enumeration
  * 
  * State transitions:
  *   NOT_INITIALIZED -> VISUAL_ONLY: After successful 2-frame VO initialization
@@ -255,7 +255,6 @@ private:
     TrackingState m_tracking_state;  // Current tracking state (NOT_INITIALIZED -> VISUAL_ONLY -> VIO)
     float m_min_parallax;
     
-    // ORB-SLAM3 style IMU initialization tracking
     double m_first_keyframe_time;    // Timestamp of first keyframe (for 2s requirement)
     double m_last_keyframe_time;     // Timestamp of last keyframe (for 0.25s interval)
     

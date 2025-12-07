@@ -280,7 +280,7 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                 first_frame->SetKeyframe(true);
                 last_frame->SetKeyframe(true);
                 
-                // Record keyframe times for ORB-SLAM3 style IMU init
+          
                 m_first_keyframe_time = first_frame->GetTimestamp();
                 m_last_keyframe_time = last_frame->GetTimestamp();
                 
@@ -332,7 +332,6 @@ Estimator::EstimationResult Estimator::ProcessFrame(
     case TrackingState::VISUAL_ONLY: {
         // =================================================================
         // State: VISUAL_ONLY - PnP tracking, time-based KF, wait for IMU init
-        // ORB-SLAM3: No IMU prediction, just visual tracking
         // =================================================================
         int num_tracked = TrackFeatures();
         
@@ -386,7 +385,6 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             DetectFeatures();
         }
         
-        // ORB-SLAM3 style: Time-based keyframe creation (every 0.25s before IMU init)
         bool should_create_kf = false;
         double time_since_last_kf = timestamp - m_last_keyframe_time;
         constexpr double KF_INTERVAL_BEFORE_IMU_INIT = 0.25;  // 0.25 seconds
@@ -400,7 +398,6 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             CreateKeyframe();
             m_last_keyframe_time = timestamp;
             
-            // ORB-SLAM3 IMU init conditions: 10 keyframes AND 2 seconds
             constexpr int MIN_KF_FOR_IMU_INIT = 10;
             constexpr double MIN_TIME_FOR_IMU_INIT = 2.0;  // seconds
             
@@ -543,9 +540,16 @@ void Estimator::ProcessIMU(const std::vector<IMUData>& imu_data) {
         return;
     }
     
-    // Get current bias estimates from previous frame
-    Eigen::Vector3f accel_bias = m_previous_frame->GetAccelBias();
-    Eigen::Vector3f gyro_bias = m_previous_frame->GetGyroBias();
+    // Get current bias estimates from last keyframe (BA updates keyframe bias)
+    // Fall back to previous frame if no keyframe exists yet
+    Eigen::Vector3f accel_bias, gyro_bias;
+    if (m_last_keyframe) {
+        accel_bias = m_last_keyframe->GetAccelBias();
+        gyro_bias = m_last_keyframe->GetGyroBias();
+    } else {
+        accel_bias = m_previous_frame->GetAccelBias();
+        gyro_bias = m_previous_frame->GetGyroBias();
+    }
     
     // Set bias in preintegrator
     m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
@@ -735,10 +739,16 @@ std::shared_ptr<Frame> Estimator::CreateFrame(const cv::Mat& image, double times
     // Set camera-to-body extrinsic transformation
     frame->SetTBC(config.T_BC);
     
-    // Copy bias from previous frame (after IMU initialization)
-    if (m_tracking_state == TrackingState::VIO && m_previous_frame) {
-        frame->SetGyroBias(m_previous_frame->GetGyroBias());
-        frame->SetAccelBias(m_previous_frame->GetAccelBias());
+    // Copy bias from last keyframe (BA updates keyframe bias)
+    // Fall back to previous frame if no keyframe exists yet
+    if (m_tracking_state == TrackingState::VIO) {
+        if (m_last_keyframe) {
+            frame->SetGyroBias(m_last_keyframe->GetGyroBias());
+            frame->SetAccelBias(m_last_keyframe->GetAccelBias());
+        } else if (m_previous_frame) {
+            frame->SetGyroBias(m_previous_frame->GetGyroBias());
+            frame->SetAccelBias(m_previous_frame->GetAccelBias());
+        }
     }
     
     return frame;
@@ -951,7 +961,6 @@ void Estimator::CreateKeyframe() {
     }
     
     // Note: IMU initialization is now handled in ProcessFrame VISUAL_ONLY state
-    // with ORB-SLAM3 style conditions (10 KF, 2 seconds)
 }
 
 void Estimator::LinkMapPointsFromPreviousFrame() {
@@ -994,7 +1003,6 @@ void Estimator::LinkMapPointsFromPreviousFrame() {
 }
 
 // DEPRECATED: This function was used for interpolation-based initialization.
-// ORB-SLAM3 style uses real tracking instead. Kept for reference but not called.
 void Estimator::ProcessIntermediateFrames() {
     if (m_frame_window.size() < 3) {
         return;  // No intermediate frames
@@ -1517,7 +1525,6 @@ bool Estimator::TryInitializeIMU() {
     m_gyro_bias = result.gyro_bias;
     m_accel_bias = result.accel_bias;
     
-    // Apply scaled poses from optimizer (ORB-SLAM3 style: scale applied internally)
     for (size_t i = 0; i < m_keyframes.size() && i < result.scaled_poses.size(); ++i) {
         m_keyframes[i]->SetTwb(result.scaled_poses[i]);
     }
@@ -1751,7 +1758,7 @@ bool Estimator::TryInitializeIMUWithInterpolation() {
              m_gyro_bias.x(), m_gyro_bias.y(), m_gyro_bias.z(), gyro_pairs);
     
     // =========================================================================
-    // STEP 4: Gravity Direction Estimation (ORB-SLAM3 style)
+    // STEP 4: Gravity Direction Estimation
     // Use delta_V from preintegration: delta_V = R_i^T * (v_j - v_i - g * dt)
     // Rearranging: R_i * delta_V = v_j - v_i - g * dt
     // Sum over all frames: gravity direction is -sum(R_i * delta_V) / sum(dt)
@@ -1774,7 +1781,6 @@ bool Estimator::TryInitializeIMUWithInterpolation() {
         Eigen::Matrix3d J_Vg = preints[i]->J_Vg.cast<double>();
         delta_V += J_Vg * gyro_bias_est;
         
-        // ORB-SLAM3: dirG = -sum(R_i * delta_V)
         // This accumulates the acceleration direction
         dirG -= R_i * delta_V;
         total_dt += dt;
@@ -1786,7 +1792,6 @@ bool Estimator::TryInitializeIMUWithInterpolation() {
         return false;
     }
     
-    // ORB-SLAM3 style: gravity direction from accumulated delta_V
     // dirG points in the gravity direction (scaled by time)
     Eigen::Vector3d gravity_dir = dirG / total_dt;  // Average acceleration
     double gravity_norm = gravity_dir.norm();
