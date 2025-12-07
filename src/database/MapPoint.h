@@ -110,6 +110,23 @@ public:
     void SetMarginalized(bool marginalized = true) { m_is_marginalized = marginalized; }
     bool IsMarginalized() const { return m_is_marginalized; }
     
+    // ============ BA Optimization Count ============
+    
+    /**
+     * @brief Increment BA optimization count
+     */
+    void IncrementBACount() { m_ba_count++; }
+    
+    /**
+     * @brief Get BA optimization count
+     */
+    int GetBACount() const { return m_ba_count; }
+    
+    /**
+     * @brief Reset BA optimization count
+     */
+    void ResetBACount() { m_ba_count = 0; }
+    
     // ============ Reference Keyframe Management ============
     
     /**
@@ -152,6 +169,7 @@ private:
     bool m_is_bad;                               ///< Bad flag (invalid point)
     bool m_is_triangulated;                      ///< Successfully triangulated
     bool m_is_marginalized;                      ///< Marginalized flag (do not optimize or remove)
+    int m_ba_count;                              ///< Number of times optimized in BA
     
     std::weak_ptr<Frame> m_reference_keyframe;   ///< First keyframe that observed this point (origin)
     

@@ -170,9 +170,16 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         feature_indices.push_back(feat_idx);
         mappoints.push_back(mp);
         
+        // Marginalized MapPoints get 2x weight (scale preserving)
+        double weight = mp->IsMarginalized() ? 2.0 : 1.0;
+        ceres::LossFunction* loss = new ceres::HuberLoss(m_huber_delta);
+        if (weight > 1.0) {
+            loss = new ceres::ScaledLoss(loss, weight, ceres::TAKE_OWNERSHIP);
+        }
+        
         problem.AddResidualBlock(
             cost,
-            new ceres::HuberLoss(m_huber_delta),
+            loss,
             pose_params
         );
     }
@@ -390,9 +397,16 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
             factors.push_back(cost);
             factor_indices.push_back({fi, pi});
             
+            // Marginalized MapPoints get 2x weight (scale preserving)
+            double weight = mp->IsMarginalized() ? 2.0 : 1.0;
+            ceres::LossFunction* loss = new ceres::HuberLoss(m_huber_delta);
+            if (weight > 1.0) {
+                loss = new ceres::ScaledLoss(loss, weight, ceres::TAKE_OWNERSHIP);
+            }
+            
             problem.AddResidualBlock(
                 cost,
-                new ceres::HuberLoss(m_huber_delta),
+                loss,
                 pose_params[fi].data(),
                 point_params[pi].data()
             );
@@ -614,9 +628,16 @@ BAResult Optimizer::RunLocalBAwithInertial(const std::vector<std::shared_ptr<Fra
             ba_factors.push_back(cost);
             ba_factor_indices.push_back({fi, pi});
             
+            // Marginalized MapPoints get 2x weight (scale preserving)
+            double weight = mp->IsMarginalized() ? 2.0 : 1.0;
+            ceres::LossFunction* loss = new ceres::HuberLoss(m_huber_delta);
+            if (weight > 1.0) {
+                loss = new ceres::ScaledLoss(loss, weight, ceres::TAKE_OWNERSHIP);
+            }
+            
             problem.AddResidualBlock(
                 cost,
-                new ceres::HuberLoss(m_huber_delta),
+                loss,
                 pose_params[fi].data(),
                 point_params[pi].data()
             );
@@ -816,11 +837,23 @@ BAResult Optimizer::RunLocalBAwithInertial(const std::vector<std::shared_ptr<Fra
     }
     
     // Update MapPoints
+    int newly_marginalized = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
         if (!mappoints[i]->IsMarginalized()) {
             Eigen::Vector3f new_pos(point_params[i][0], point_params[i][1], point_params[i][2]);
             mappoints[i]->SetPosition(new_pos);
+            
+            // Increment BA count and marginalize if optimized at least once
+            mappoints[i]->IncrementBACount();
+            if (mappoints[i]->GetBACount() >= 1) {
+                mappoints[i]->SetMarginalized(true);
+                newly_marginalized++;
+            }
         }
+    }
+    
+    if (newly_marginalized > 0) {
+        LOG_DEBUG("  LocalBA+I: {} MapPoints marginalized (BA count >= 1)", newly_marginalized);
     }
     
     result.success = summary.IsSolutionUsable();
@@ -1313,9 +1346,16 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
             factors.push_back(cost);
             factor_indices.push_back({fi, pi});
             
+            // Marginalized MapPoints get 2x weight (scale preserving)
+            double weight = mp->IsMarginalized() ? 2.0 : 1.0;
+            ceres::LossFunction* loss = new ceres::HuberLoss(m_huber_delta);
+            if (weight > 1.0) {
+                loss = new ceres::ScaledLoss(loss, weight, ceres::TAKE_OWNERSHIP);
+            }
+            
             problem.AddResidualBlock(
                 cost,
-                new ceres::HuberLoss(m_huber_delta),
+                loss,
                 pose_params[fi].data(),
                 point_params[pi].data()
             );
@@ -1428,12 +1468,24 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     
     // Update MapPoints that were optimized (not fixed)
     int mp_updated = 0;
+    int newly_marginalized = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
         if (!mappoints[i]->IsMarginalized()) {
             Eigen::Vector3f new_pos(point_params[i][0], point_params[i][1], point_params[i][2]);
             mappoints[i]->SetPosition(new_pos);
             mp_updated++;
+            
+            // Increment BA count and marginalize if optimized at least once
+            mappoints[i]->IncrementBACount();
+            if (mappoints[i]->GetBACount() >= 1) {
+                mappoints[i]->SetMarginalized(true);
+                newly_marginalized++;
+            }
         }
+    }
+    
+    if (newly_marginalized > 0) {
+        LOG_DEBUG("  LocalBA: {} MapPoints marginalized (BA count >= 1)", newly_marginalized);
     }
     
     result.success = summary.IsSolutionUsable();
@@ -1530,6 +1582,8 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
     
     // Scale parameter
     std::vector<double> scale_params(1, 1.0);
+
+    // Let's fix scale during IMU initialization
     
     // Initialize poses from frames, applying initial_scale to translations
     for (size_t i = 0; i < num_frames; ++i) {
@@ -1743,6 +1797,71 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
     }
     
     // =========================================================================
+    // STAGE 2.5: Estimate Initial Scale from IMU Preintegration
+    // Using: p_j - p_i = v_i * dt + 0.5 * g * dt^2 + R_i * delta_p
+    // Solve for scale: s = ||R_i * delta_P|| / ||d_visual||
+    // delta_P from preintegration is the pure IMU displacement (body frame)
+    // =========================================================================
+    
+    LOG_INFO("STAGE 2.5: Scale Estimation from IMU");
+    
+    {
+        // Compute scale ratio for each segment, then take median
+        std::vector<double> scale_ratios;
+        
+        for (size_t i = 0; i < num_frames - 1; ++i) {
+            auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+            if (!preint || preint->dt_total < 0.001 || preint->dt_total > 2.0) continue;
+            
+            Eigen::Matrix3d R_wb_i = T_wb_inits[i].block<3,3>(0,0);
+            
+            // Visual translation
+            Eigen::Vector3d t_i = T_wb_inits[i].block<3,1>(0,3);
+            Eigen::Vector3d t_j = T_wb_inits[i+1].block<3,1>(0,3);
+            Eigen::Vector3d d_visual = t_j - t_i;
+            double visual_norm = d_visual.norm();
+            
+            // Skip if visual displacement is too small (noisy ratio)
+            if (visual_norm < 0.01) continue;
+            
+            // IMU preintegration displacement (corrected with gyro bias)
+            Eigen::Vector3d delta_p = preint->delta_P.cast<double>();
+            Eigen::Matrix3d J_Pg = preint->J_Pg.cast<double>();
+            Eigen::Vector3d bg(gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
+            delta_p = delta_p + J_Pg * bg;
+            
+            // Transform to world frame
+            Eigen::Vector3d d_imu = R_wb_i * delta_p;
+            double imu_norm = d_imu.norm();
+            
+            // Compute ratio for this segment
+            double ratio = imu_norm / visual_norm;
+            scale_ratios.push_back(ratio);
+        }
+        
+        if (!scale_ratios.empty()) {
+            // Take median for robustness against outliers
+            std::sort(scale_ratios.begin(), scale_ratios.end());
+            double estimated_scale;
+            size_t n = scale_ratios.size();
+            if (n % 2 == 0) {
+                estimated_scale = (scale_ratios[n/2 - 1] + scale_ratios[n/2]) / 2.0;
+            } else {
+                estimated_scale = scale_ratios[n/2];
+            }
+            
+            // Clamp to reasonable range
+            estimated_scale = std::max(0.1, std::min(10.0, estimated_scale));
+            scale_params[0] = estimated_scale;
+            LOG_INFO("  Estimated scale: {:.4f} (median of {} ratios, range=[{:.3f}, {:.3f}])", 
+                     estimated_scale, n, scale_ratios.front(), scale_ratios.back());
+        } else {
+            scale_params[0] = 1.0;
+            LOG_WARN("  Could not estimate scale, using 1.0");
+        }
+    }
+    
+    // =========================================================================
     // STAGE 3: Joint Optimization (Gravity + Accel Bias + Scale + Velocity)
     // Gyro bias is FIXED from Stage 0
     // =========================================================================
@@ -1787,9 +1906,17 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
         
         // Add weak accel bias prior (regularization toward zero)
         Eigen::Vector3d zero_bias = Eigen::Vector3d::Zero();
-        double accel_bias_weight = 0.1;
+        double accel_bias_weight = 1.0;
         auto* accel_prior = new factor::BiasPriorFactor(zero_bias, accel_bias_weight);
         problem.AddResidualBlock(accel_prior, nullptr, accel_bias_params.data());
+        
+        // Add scale prior from Stage 2.5 estimation
+        double scale_prior_value = scale_params[0];
+        double scale_prior_weight = 0.0045;  // Weak prior - allows optimization to adjust
+        auto* scale_prior = new factor::ScalarPriorFactor(scale_prior_value, scale_prior_weight);
+        problem.AddResidualBlock(scale_prior, nullptr, scale_params.data());
+        
+        LOG_INFO("  Scale prior: {:.4f} (weight={:.2f})", scale_prior_value, scale_prior_weight);
         
         // FIXED: All poses, Gyro bias
         for (size_t i = 0; i < num_frames; ++i) {
@@ -1804,7 +1931,7 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
         // Solve
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::DENSE_QR;
-        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        // options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
         options.max_num_iterations = 200;
         options.minimizer_progress_to_stdout = false;
         
@@ -1845,13 +1972,43 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
     Eigen::Vector3d g_I(0, 0, -gravity_mag);
     Eigen::Vector3d gravity = R_wg * g_I;
     
-    // Apply final scale to poses
+    // Apply final scale to poses (relative to first frame)
     Eigen::Vector3d t0 = T_wb_inits[0].block<3,1>(0,3);
     for (size_t i = 1; i < num_frames; ++i) {
         Eigen::Vector3d t_i = T_wb_inits[i].block<3,1>(0,3);
-        Eigen::Vector3d t_i_new = t0 + scale_params[0] * (t_i - t0);
+        Eigen::Vector3d t_i_new = t0 + final_scale * (t_i - t0);
         T_wb_inits[i].block<3,1>(0,3) = t_i_new;
     }
+    
+    // Apply final scale to MapPoints (relative to first camera frame)
+    // Collect all unique MapPoints from frames
+    std::set<std::shared_ptr<MapPoint>> unique_mps;
+    for (const auto& frame : frames) {
+        const auto& features = frame->GetFeatures();
+        for (size_t i = 0; i < features.size(); ++i) {
+            auto mp = frame->GetMapPoint(static_cast<int>(i));
+            if (mp && !mp->IsBad()) {
+                unique_mps.insert(mp);
+            }
+        }
+    }
+    
+    // Scale MapPoints relative to first camera position
+    Eigen::Matrix4d Twc_0 = frames[0]->GetTwc().cast<double>();
+    Eigen::Matrix4d Tcw_0 = Twc_0.inverse();
+    
+    for (const auto& mp : unique_mps) {
+        Eigen::Vector3d pos_w = mp->GetPosition().cast<double>();
+        // Transform to first camera frame
+        Eigen::Vector3d pos_c = Tcw_0.block<3,3>(0,0) * pos_w + Tcw_0.block<3,1>(0,3);
+        // Apply scale
+        pos_c *= final_scale;
+        // Transform back to world
+        Eigen::Vector3d pos_w_new = Twc_0.block<3,3>(0,0) * pos_c + Twc_0.block<3,1>(0,3);
+        mp->SetPosition(pos_w_new.cast<float>());
+    }
+    
+    LOG_INFO("  Scaled {} MapPoints with scale={:.4f}", unique_mps.size(), final_scale);
     
     // Store results
     result.success = true;

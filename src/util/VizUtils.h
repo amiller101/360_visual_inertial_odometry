@@ -101,11 +101,6 @@ public:
     void SetDataDirectory(const std::string& dir) { m_data_directory = dir; }
     
     /**
-     * @brief Save trajectory to file in TUM format
-     */
-    void SaveTrajectory(const Estimator* estimator);
-    
-    /**
      * @brief Get color from age
      */
     static cv::Scalar GetColorFromAge(int age, int max_age = 10);

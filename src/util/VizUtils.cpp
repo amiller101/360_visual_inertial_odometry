@@ -111,7 +111,16 @@ void VizUtils::Update(const Estimator* estimator,
     
     // Check Finish & Save button
     if (pangolin::Pushed(*m_finish_save_button)) {
-        SaveTrajectory(estimator);
+        // Build output path
+        std::string output_path;
+        if (!m_data_directory.empty()) {
+            output_path = m_data_directory;
+            if (output_path.back() != '/') output_path += '/';
+            output_path += "estimated_trajectory.txt";
+        } else {
+            output_path = "estimated_trajectory.txt";
+        }
+        estimator->SaveTrajectory(output_path);
         pangolin::Quit();  // Signal to close the application
     }
     
@@ -584,65 +593,6 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
     }
     
     return vis_image;
-}
-
-void VizUtils::SaveTrajectory(const Estimator* estimator) {
-    if (!estimator) {
-        std::cerr << "[VizUtils] Cannot save trajectory: estimator is null" << std::endl;
-        return;
-    }
-    
-    // Use keyframes only
-    const auto& keyframes = estimator->GetKeyframes();
-    if (keyframes.empty()) {
-        std::cerr << "[VizUtils] Cannot save trajectory: no keyframes" << std::endl;
-        return;
-    }
-    
-    // Determine output path
-    std::string output_path;
-    if (!m_data_directory.empty()) {
-        output_path = m_data_directory;
-        if (output_path.back() != '/') output_path += '/';
-        output_path += "estimated_trajectory.txt";
-    } else {
-        output_path = "estimated_trajectory.txt";
-    }
-    
-    std::ofstream file(output_path);
-    if (!file.is_open()) {
-        std::cerr << "[VizUtils] Failed to open file for writing: " << output_path << std::endl;
-        return;
-    }
-    
-    // Write trajectory in TUM format: timestamp tx ty tz qx qy qz qw (no header)
-    file << std::fixed << std::setprecision(9);
-    
-    int saved_count = 0;
-    for (const auto& kf : keyframes) {
-        if (!kf) continue;
-        
-        double timestamp = kf->GetTimestamp();
-        Eigen::Matrix4f T_wb = kf->GetTwb();
-        
-        // Extract translation
-        Eigen::Vector3f t = T_wb.block<3, 1>(0, 3);
-        
-        // Extract rotation and convert to quaternion
-        Eigen::Matrix3f R = T_wb.block<3, 3>(0, 0);
-        Eigen::Quaternionf q(R);
-        q.normalize();
-        
-        // TUM format: timestamp tx ty tz qx qy qz qw
-        file << timestamp << " "
-             << t.x() << " " << t.y() << " " << t.z() << " "
-             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
-        saved_count++;
-    }
-    
-    file.close();
-    std::cout << "[VizUtils] Saved keyframe trajectory to: " << output_path 
-              << " (" << saved_count << " keyframes)" << std::endl;
 }
 
 } // namespace vio_360

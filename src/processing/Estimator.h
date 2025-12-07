@@ -200,10 +200,10 @@ public:
     const std::vector<std::shared_ptr<Frame>>& GetKeyframes() const { return m_keyframes; }
     
     /**
-     * @brief Get all keyframes including those outside the window
-     * @return Vector of all keyframes ever created
+     * @brief Get marginalized keyframe poses (timestamp, T_wb)
+     * @return Vector of (timestamp, pose) pairs for keyframes that left the window
      */
-    const std::vector<std::shared_ptr<Frame>>& GetAllKeyframes() const { return m_all_keyframes; }
+    const std::vector<std::pair<double, Eigen::Matrix4f>>& GetMarginalizedPoses() const { return m_marginalized_poses; }
     
     /**
      * @brief Check if a keyframe is in the current sliding window
@@ -217,6 +217,12 @@ public:
      * @return Number of keyframes in window
      */
     int GetWindowSize() const { return static_cast<int>(m_keyframes.size()); }
+    
+    /**
+     * @brief Save trajectory to file (marginalized + current window)
+     * @param output_path Path to output file (TUM format)
+     */
+    void SaveTrajectory(const std::string& output_path) const;
 
 private:
     // System components
@@ -232,11 +238,15 @@ private:
     std::shared_ptr<Frame> m_last_keyframe;
     std::vector<std::shared_ptr<Frame>> m_all_frames;
     std::vector<std::shared_ptr<Frame>> m_keyframes;         // Sliding window keyframes
-    std::vector<std::shared_ptr<Frame>> m_all_keyframes;     // All keyframes (including out of window)
+    
+    // Marginalized keyframe poses (timestamp, T_wb) - saved when keyframe leaves window
+    std::vector<std::pair<double, Eigen::Matrix4f>> m_marginalized_poses;
     
     // Frame window for initialization
     std::vector<std::shared_ptr<Frame>> m_frame_window;
-    int m_window_size;
+    int m_window_size;           // Current window size (init or tracking)
+    int m_init_window_size;      // Window size for initialization
+    int m_tracking_window_size;  // Window size for tracking (after init)
     
     // Frame management
     int m_frame_id_counter;
@@ -343,6 +353,12 @@ private:
      * @param scale Scale factor to apply (1.0 for stereo/RGBD)
      */
     void ApplyGravityAlignmentTransform(const Eigen::Matrix3f& Rwg, float scale);
+    
+    /**
+     * @brief Shrink window after IMU initialization
+     * Reduces window from init size to tracking size, marginalizing old keyframes
+     */
+    void ShrinkWindowAfterInit();
     
     /**
      * @brief Link MapPoints from previous frame to current frame based on feature tracking

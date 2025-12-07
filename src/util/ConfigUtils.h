@@ -60,18 +60,24 @@ public:
     // Tracking
     float tracking_min_features_ratio;
     float tracking_min_parallax_for_keyframe;
+    int tracking_window_size;
     
     // Initialization
     int initialization_window_size;
     float initialization_min_parallax;
     int initialization_min_features;
     int initialization_min_observations;
-    int initialization_grid_cols;
-    int initialization_grid_rows;
     float initialization_ransac_threshold;
     int initialization_ransac_iterations;
     float initialization_min_inlier_ratio;
     float initialization_max_reprojection_error;
+    // Initialization feature detection
+    int initialization_max_features;
+    double initialization_quality_level;
+    double initialization_min_distance;
+    int initialization_grid_cols;
+    int initialization_grid_rows;
+    int initialization_max_features_per_grid;
     
     // Visualization
     float visualization_scale;

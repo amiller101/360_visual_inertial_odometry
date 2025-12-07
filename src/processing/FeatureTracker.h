@@ -135,6 +135,12 @@ public:
     
     void SetMaxFeatures(int max_features) { m_max_features = max_features; }
     void SetMinDistance(float min_distance) { m_min_distance = min_distance; }
+    void SetQualityLevel(float quality_level) { m_quality_level = quality_level; }
+    void SetGridParams(int cols, int rows, int max_per_grid) { 
+        m_grid_cols = cols; 
+        m_grid_rows = rows; 
+        m_max_features_per_grid = max_per_grid; 
+    }
     int GetMaxFeatures() const { return m_max_features; }
     
 private:

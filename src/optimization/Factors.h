@@ -358,6 +358,34 @@ private:
 };
 
 /**
+ * @brief Simple scalar prior factor
+ * 
+ * Applies a Gaussian prior on a scalar parameter:
+ * cost = 0.5 * weight * (value - prior)^2
+ */
+class ScalarPriorFactor : public ceres::SizedCostFunction<1, 1> {
+public:
+    ScalarPriorFactor(double prior, double weight)
+        : prior_(prior), weight_(weight) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                         double* residuals,
+                         double** jacobians) const override {
+        residuals[0] = weight_ * (parameters[0][0] - prior_);
+        
+        if (jacobians != nullptr && jacobians[0] != nullptr) {
+            jacobians[0][0] = weight_;
+        }
+        
+        return true;
+    }
+
+private:
+    double prior_;
+    double weight_;
+};
+
+/**
  * @brief Simple bias prior factor
  * 
  * Applies a zero-mean Gaussian prior on IMU biases:

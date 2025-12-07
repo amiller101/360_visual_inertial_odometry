@@ -54,19 +54,25 @@ void ConfigUtils::SetDefaultValues() {
     
     // Tracking
     tracking_min_features_ratio = 0.5f;
-    tracking_min_parallax_for_keyframe = 10.0f;
+    tracking_min_parallax_for_keyframe = 20.0f;
+    tracking_window_size = 5;
     
     // Initialization
     initialization_window_size = 20;
     initialization_min_parallax = 10.0f;
     initialization_min_features = 50;
     initialization_min_observations = 10;
-    initialization_grid_cols = 8;
-    initialization_grid_rows = 4;
     initialization_ransac_threshold = 0.001f;
     initialization_ransac_iterations = 200;
     initialization_min_inlier_ratio = 0.7f;
     initialization_max_reprojection_error = 2.0f;
+    // Initialization feature detection (defaults same as tracking)
+    initialization_max_features = 1000;
+    initialization_quality_level = 0.01;
+    initialization_min_distance = 30.0;
+    initialization_grid_cols = 20;
+    initialization_grid_rows = 10;
+    initialization_max_features_per_grid = 10;
     
     // Visualization
     visualization_scale = 1.0f;
@@ -147,6 +153,9 @@ bool ConfigUtils::Load(const std::string& config_file) {
         if (!tracking["min_parallax_for_keyframe"].empty()) {
             tracking_min_parallax_for_keyframe = (float)(double)tracking["min_parallax_for_keyframe"];
         }
+        if (!tracking["window_size"].empty()) {
+            tracking_window_size = (int)tracking["window_size"];
+        }
     }
     
     // Initialization
@@ -156,12 +165,29 @@ bool ConfigUtils::Load(const std::string& config_file) {
         initialization_min_parallax = (float)(double)initialization["min_parallax"];
         initialization_min_features = (int)initialization["min_features"];
         initialization_min_observations = (int)initialization["min_observations"];
-        initialization_grid_cols = (int)initialization["grid_cols"];
-        initialization_grid_rows = (int)initialization["grid_rows"];
         initialization_ransac_threshold = (float)(double)initialization["ransac_threshold"];
         initialization_ransac_iterations = (int)initialization["ransac_iterations"];
         initialization_min_inlier_ratio = (float)(double)initialization["min_inlier_ratio"];
         initialization_max_reprojection_error = (float)(double)initialization["max_reprojection_error"];
+        
+        // Initialization feature detection (nested under initialization)
+        cv::FileNode init_feat = initialization["feature_detection"];
+        if (!init_feat.empty()) {
+            initialization_max_features = (int)init_feat["max_features"];
+            initialization_quality_level = (double)init_feat["quality_level"];
+            initialization_min_distance = (double)init_feat["min_distance"];
+            initialization_grid_cols = (int)init_feat["grid_cols"];
+            initialization_grid_rows = (int)init_feat["grid_rows"];
+            initialization_max_features_per_grid = (int)init_feat["max_features_per_grid"];
+        } else {
+            // Fallback to tracking feature detection settings
+            initialization_max_features = max_features;
+            initialization_quality_level = quality_level;
+            initialization_min_distance = min_distance;
+            initialization_grid_cols = grid_cols;
+            initialization_grid_rows = grid_rows;
+            initialization_max_features_per_grid = max_features_per_grid;
+        }
     }
     
     // Visualization

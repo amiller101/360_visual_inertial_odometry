@@ -4,5 +4,5 @@ ToDo List
 - [X] Featrue traking on ERP image
 - [X] Monocular Initialization
 - [X] Omnidirectional VO
-- [ ] IMU Initialization
+- [X] IMU Initialization
 - [ ] Omnidirectional VIO

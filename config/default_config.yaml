@@ -29,18 +29,24 @@ ransac:
 tracking:
   min_features_ratio: 0.5
   min_parallax_for_keyframe: 10.0  # Minimum parallax (pixels) to create new keyframe
+  window_size: 10  # Sliding window size for tracking (after initialization)
 
 initialization:
   window_size: 10
   min_parallax: 10.0
   min_features: 100
   min_observations: 10
-  grid_cols: 20
-  grid_rows: 10
   ransac_threshold: 0.1  # ~6 degrees (sin(6°) ≈ 0.1)
   ransac_iterations: 200
   min_inlier_ratio: 0.7
   max_reprojection_error: 5.0  # Maximum reprojection error in pixels
+  feature_detection:
+    max_features: 1000
+    quality_level: 0.01
+    min_distance: 30.0
+    grid_cols: 20
+    grid_rows: 10
+    max_features_per_grid: 10
 
 visualization:
   scale: 1.0
@@ -61,8 +67,8 @@ extrinsics:
     - [0.0, 0.0, 0.0, 1.0]
 
 imu:
-  frequency: 200.0
-  gyro_noise: 0.001
+  frequency: 500.0
+  gyro_noise: 0.01
   accel_noise: 0.01
   gyro_bias_noise: 0.0001
   accel_bias_noise: 0.001
