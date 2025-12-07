@@ -32,19 +32,19 @@ class Frame {
 public:
     /**
      * @brief Constructor
-     * @param timestamp Frame timestamp in nanoseconds
+     * @param timestamp Frame timestamp in seconds (double precision)
      * @param frame_id Unique frame identifier
      * @param image Grayscale image (already resized if needed)
      * @param width Original image width
      * @param height Original image height
      */
-    Frame(long long timestamp, int frame_id, const cv::Mat& image, int width, int height);
+    Frame(double timestamp, int frame_id, const cv::Mat& image, int width, int height);
     
     ~Frame() = default;
     
     // ============ Getters ============
     
-    long long GetTimestamp() const { return m_timestamp; }
+    double GetTimestamp() const { return m_timestamp; }
     int GetFrameId() const { return m_frame_id; }
     const cv::Mat& GetImage() const { return m_image; }
     int GetWidth() const { return m_width; }
@@ -273,7 +273,7 @@ public:
     
 private:
     // Frame information
-    long long m_timestamp;         // Timestamp in nanoseconds
+    double m_timestamp;            // Timestamp in seconds (double precision)
     int m_frame_id;                // Unique frame ID
     cv::Mat m_image;               // Grayscale image
     int m_width;                   // Image width

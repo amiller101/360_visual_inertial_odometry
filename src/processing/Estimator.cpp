@@ -26,14 +26,16 @@ namespace vio_360 {
 
 Estimator::Estimator()
     : m_frame_id_counter(0)
-    , m_initialized(false)
-    , m_imu_initialized(false)
+    , m_tracking_state(TrackingState::NOT_INITIALIZED)
     , m_current_pose(Eigen::Matrix4f::Identity())
     , m_transform_from_last(Eigen::Matrix4f::Identity())
     , m_gravity(0, 0, -9.81f)
     , m_gyro_bias(Eigen::Vector3f::Zero())
     , m_accel_bias(Eigen::Vector3f::Zero())
-    , m_scale(1.0) {
+    , m_scale(1.0)
+    , m_imu_init_frame_idx(-1)
+    , m_first_keyframe_time(-1.0)
+    , m_last_keyframe_time(-1.0) {
     
     // Initialize camera
     const auto& config = ConfigUtils::GetInstance();
@@ -74,71 +76,52 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
     // Create new frame
     m_current_frame = CreateFrame(image, timestamp);
     
-    if (!m_initialized) {
-        // Not initialized yet - accumulate frames for initialization
+    // =========================================================================
+    // State Machine: NOT_INITIALIZED -> VISUAL_ONLY -> VIO (without IMU data)
+    // =========================================================================
+    
+    switch (m_tracking_state) {
+    case TrackingState::NOT_INITIALIZED: {
         if (m_previous_frame) {
-            // Track features for initialization
             result.num_tracked = TrackFeatures();
         } else {
-            // First frame - detect features
             DetectFeatures();
         }
         
-        // Add current frame to window
         m_frame_window.push_back(m_current_frame);
         
-        // Maintain window size
         if (static_cast<int>(m_frame_window.size()) > m_window_size) {
             m_frame_window.erase(m_frame_window.begin());
         }
         
         LOG_DEBUG("  Window size: {}/{}, trying init...", m_frame_window.size(), m_window_size);
         
-        // Try to initialize when window is full
         if (static_cast<int>(m_frame_window.size()) == m_window_size) {
             bool init_result = TryInitialize();
             
             if (init_result) {
-                // Initialization succeeded!
                 result.init_success = true;
-                m_initialized = true;
+                m_tracking_state = TrackingState::VISUAL_ONLY;
                 
                 LOG_INFO("Initialization SUCCESS!");
                 
-                // Set initialization keyframes
                 auto first_frame = m_frame_window.front();
                 auto last_frame = m_frame_window.back();
                 
                 first_frame->SetKeyframe(true);
                 last_frame->SetKeyframe(true);
                 
-                // Compute preintegration from first_frame to last_frame for IMU init
-                if (!m_imu_since_last_keyframe.empty()) {
-                    Eigen::Vector3f gyro_bias = first_frame->GetGyroBias();
-                    Eigen::Vector3f accel_bias = first_frame->GetAccelBias();
-                    m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
-                    
-                    double start_time = m_imu_since_last_keyframe.front().timestamp;
-                    double end_time = m_imu_since_last_keyframe.back().timestamp;
-                    
-                    auto preint_from_first_kf = m_imu_preintegrator->Preintegrate(
-                        m_imu_since_last_keyframe, start_time, end_time
-                    );
-                    
-                    if (preint_from_first_kf) {
-                        last_frame->SetIMUPreintegrationFromLastKeyframe(preint_from_first_kf);
-                        LOG_INFO("  IMU preintegration: kf {} -> kf {}: dt={:.3f}s, {} samples",
-                                 first_frame->GetFrameId(), last_frame->GetFrameId(),
-                                 preint_from_first_kf->dt_total, m_imu_since_last_keyframe.size());
-                    }
-                    m_imu_since_last_keyframe.clear();
-                }
+                m_first_keyframe_time = first_frame->GetTimestamp();
+                m_last_keyframe_time = last_frame->GetTimestamp();
                 
                 m_keyframes.push_back(first_frame);
                 m_keyframes.push_back(last_frame);
+                m_all_keyframes.push_back(first_frame);
+                m_all_keyframes.push_back(last_frame);
                 m_last_keyframe = last_frame;
+                
+                m_current_pose = last_frame->GetTwb();
             } else {
-                // Check if ready for initialization (sufficient parallax)
                 if (m_frame_window.size() >= 2) {
                     auto first_frame = m_frame_window.front();
                     auto last_frame = m_frame_window.back();
@@ -146,21 +129,20 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
                     
                     if (parallax >= m_min_parallax) {
                         result.init_ready = true;
-                        // Note: Don't set init_success here - only on actual success
                     }
                 }
             }
         }
-    } else {
-        // Already initialized - normal tracking
-        
-        // Track features from previous frame
+        break;
+    }
+    
+    case TrackingState::VISUAL_ONLY:
+    case TrackingState::VIO: {
+        // Already initialized - normal tracking (no IMU data available)
         int num_tracked = TrackFeatures();
         
-        // Link MapPoints from previous frame to current frame
         LinkMapPointsFromPreviousFrame();
         
-        // Count valid MapPoints
         int valid_mp_count = 0;
         const auto& features = m_current_frame->GetFeatures();
         for (size_t j = 0; j < features.size(); ++j) {
@@ -170,30 +152,20 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             }
         }
         
-        // Initialize pose: use IMU prediction if available, otherwise use previous pose
-        bool imu_predicted = false;
-        if (m_imu_initialized) {
-            imu_predicted = PredictStateWithIMU();
-        }
-        if (!imu_predicted) {
+        // Use constant velocity model (no IMU data in this overload)
+        if (m_transform_from_last.isIdentity(1e-6)) {
             m_current_frame->SetTwb(m_previous_frame->GetTwb());
+        } else {
+            Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
+            m_current_frame->SetTwb(predicted_pose);
         }
         
-        // Pose estimation using PnP
         if (valid_mp_count >= 6) {
-            // Run PnP optimization
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
             
-            // Compute parallax from last keyframe
-            float parallax_from_kf = 0.0f;
-            if (m_last_keyframe) {
-                parallax_from_kf = ComputeParallax(m_last_keyframe, m_current_frame);
-            }
-            
             if (pnp_result.success) {
-                // Set reference keyframe FIRST (before GetTwb)
                 if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
                     m_current_frame->SetReferenceKeyframe(m_last_keyframe);
                 }
@@ -214,18 +186,18 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             result.success = false;
         }
         
-        // Detect new features if needed
         if (m_current_frame->GetFeatureCount() < 100) {
             DetectFeatures();
         }
         
-        // Check if should create keyframe
         if (ShouldCreateKeyframe()) {
             CreateKeyframe();
         }
         
         result.num_tracked = num_tracked;
+        break;
     }
+    }  // end switch
     
     // Update state
     result.pose = m_current_pose;
@@ -246,18 +218,28 @@ Estimator::EstimationResult Estimator::ProcessFrame(
     // Create new frame first
     m_current_frame = CreateFrame(image, timestamp);
     
+    // Store IMU data for this frame (for interpolation-based init)
+    if (!imu_data.empty()) {
+        m_imu_data_per_frame[m_current_frame->GetFrameId()] = imu_data;
+    }
+    
     // Process IMU data and compute preintegration
     if (!imu_data.empty() && m_previous_frame) {
         ProcessIMU(imu_data);
     }
     
-    if (!m_initialized) {
-        // Not initialized yet - accumulate frames for initialization
+    // =========================================================================
+    // State Machine: NOT_INITIALIZED -> VISUAL_ONLY -> VIO
+    // =========================================================================
+    
+    switch (m_tracking_state) {
+    case TrackingState::NOT_INITIALIZED: {
+        // =================================================================
+        // State: NOT_INITIALIZED - Accumulate frames for 2-frame VO init
+        // =================================================================
         if (m_previous_frame) {
-            // Track features for initialization
             result.num_tracked = TrackFeatures();
         } else {
-            // First frame - detect features
             DetectFeatures();
         }
         
@@ -275,17 +257,56 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             
             if (init_result) {
                 result.init_success = true;
-                m_initialized = true;
                 
-                // Process all frames in window: interpolate poses, run PnP, BA, compute preintegration
-                // This creates keyframes for ALL frames in the window (not just first and last)
-                ProcessIntermediateFrames();
+                // === Transition: NOT_INITIALIZED -> VISUAL_ONLY ===
+                m_tracking_state = TrackingState::VISUAL_ONLY;
                 
-                // Now run IMU initialization with all 10 keyframes
-                if (!m_imu_initialized && m_keyframes.size() >= 3) {
-                    TryInitializeIMU();
+                LOG_INFO("VO Initialization SUCCESS! Transition to VISUAL_ONLY state.");
+                
+                // Set first and last frames as keyframes
+                auto first_frame = m_frame_window.front();
+                auto last_frame = m_frame_window.back();
+                
+                first_frame->SetKeyframe(true);
+                last_frame->SetKeyframe(true);
+                
+                // Record keyframe times for ORB-SLAM3 style IMU init
+                m_first_keyframe_time = first_frame->GetTimestamp();
+                m_last_keyframe_time = last_frame->GetTimestamp();
+                
+                // Compute preintegration from first to last keyframe
+                if (!m_imu_since_last_keyframe.empty()) {
+                    Eigen::Vector3f gyro_bias = first_frame->GetGyroBias();
+                    Eigen::Vector3f accel_bias = first_frame->GetAccelBias();
+                    m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
+                    
+                    double start_time = m_imu_since_last_keyframe.front().timestamp;
+                    double end_time = m_imu_since_last_keyframe.back().timestamp;
+                    
+                    auto preint = m_imu_preintegrator->Preintegrate(
+                        m_imu_since_last_keyframe, start_time, end_time
+                    );
+                    
+                    if (preint) {
+                        last_frame->SetIMUPreintegrationFromLastKeyframe(preint);
+                        LOG_INFO("  IMU preintegration: kf {} -> kf {}: dt={:.3f}s",
+                                 first_frame->GetFrameId(), last_frame->GetFrameId(),
+                                 preint->dt_total);
+                    }
+                    m_imu_since_last_keyframe.clear();
                 }
+                
+                m_keyframes.push_back(first_frame);
+                m_keyframes.push_back(last_frame);
+                m_all_keyframes.push_back(first_frame);
+                m_all_keyframes.push_back(last_frame);
+                m_last_keyframe = last_frame;
+                
+                m_current_pose = last_frame->GetTwb();
+                
+                // IMU initialization will be done in VISUAL_ONLY state after 10 KFs + 2 seconds
             } else {
+                // Check if ready for initialization
                 if (m_frame_window.size() >= 2) {
                     auto first_frame = m_frame_window.front();
                     auto last_frame = m_frame_window.back();
@@ -293,16 +314,21 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                     
                     if (parallax >= m_min_parallax) {
                         result.init_ready = true;
-                        result.init_success = true;
                     }
                 }
             }
         }
-    } else {
-        // Already initialized - normal tracking
+        break;
+    }
+    
+    case TrackingState::VISUAL_ONLY: {
+        // =================================================================
+        // State: VISUAL_ONLY - PnP tracking, time-based KF, wait for IMU init
+        // ORB-SLAM3: No IMU prediction, just visual tracking
+        // =================================================================
         int num_tracked = TrackFeatures();
         
-        // Link MapPoints from previous frame to current frame
+        // Link MapPoints from previous frame
         LinkMapPointsFromPreviousFrame();
         
         // Count valid MapPoints
@@ -315,51 +341,30 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             }
         }
         
-        // Initialize pose: use IMU prediction if available, otherwise constant velocity model
-        bool imu_predicted = false;
-        if (m_imu_initialized) {
-            imu_predicted = PredictStateWithIMU();
+        // Use constant velocity model for initial pose (NO IMU prediction)
+        if (m_transform_from_last.isIdentity(1e-6)) {
+            m_current_frame->SetTwb(m_previous_frame->GetTwb());
+        } else {
+            Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
+            m_current_frame->SetTwb(predicted_pose);
         }
         
-        if (!imu_predicted) {
-            // Fallback to constant velocity motion model
-            if (m_transform_from_last.isIdentity(1e-6)) {
-                // First frame after initialization, use previous pose
-                m_current_frame->SetTwb(m_previous_frame->GetTwb());
-            } else {
-                // Apply motion model: predict current pose from velocity
-                Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
-                m_current_frame->SetTwb(predicted_pose);
-            }
-        }
-        
-        // Pose estimation using PnP
+        // PnP pose estimation
         if (valid_mp_count >= 6) {
-            // Run PnP optimization
-            const auto& config = ConfigUtils::GetInstance();
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
             
-            // Compute parallax from last keyframe
-            float parallax_from_kf = 0.0f;
-            if (m_last_keyframe) {
-                parallax_from_kf = ComputeParallax(m_last_keyframe, m_current_frame);
-            }
-            
             if (pnp_result.success) {
-                // Set reference keyframe FIRST (before GetTwb)
                 if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
                     m_current_frame->SetReferenceKeyframe(m_last_keyframe);
                 }
                 
-                // Update current pose and transform for next frame
                 m_current_pose = m_current_frame->GetTwb();
                 m_transform_from_last = m_previous_frame->GetTwb().inverse() * m_current_pose;
-                
                 result.success = true;
             } else {
-                LOG_WARN("Frame {}: PnP failed", m_current_frame->GetFrameId());
+                LOG_WARN("Frame {}: PnP failed in VISUAL_ONLY", m_current_frame->GetFrameId());
                 result.success = false;
             }
         } else {
@@ -368,16 +373,150 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             result.success = false;
         }
         
+        // Detect new features if needed
         if (m_current_frame->GetFeatureCount() < 100) {
             DetectFeatures();
         }
         
+        // ORB-SLAM3 style: Time-based keyframe creation (every 0.25s before IMU init)
+        bool should_create_kf = false;
+        double time_since_last_kf = timestamp - m_last_keyframe_time;
+        constexpr double KF_INTERVAL_BEFORE_IMU_INIT = 0.25;  // 0.25 seconds
+        
+        if (time_since_last_kf >= KF_INTERVAL_BEFORE_IMU_INIT) {
+            should_create_kf = true;
+            LOG_DEBUG("Time-based keyframe: {:.3f}s since last KF", time_since_last_kf);
+        }
+        
+        if (should_create_kf && result.success) {
+            CreateKeyframe();
+            m_last_keyframe_time = timestamp;
+            
+            // ORB-SLAM3 IMU init conditions: 10 keyframes AND 2 seconds
+            constexpr int MIN_KF_FOR_IMU_INIT = 10;
+            constexpr double MIN_TIME_FOR_IMU_INIT = 2.0;  // seconds
+            
+            double total_time = timestamp - m_first_keyframe_time;
+            int num_keyframes = static_cast<int>(m_keyframes.size());
+            
+            LOG_DEBUG("IMU init check: {} KFs, {:.2f}s (need {} KFs, {:.1f}s)",
+                     num_keyframes, total_time, MIN_KF_FOR_IMU_INIT, MIN_TIME_FOR_IMU_INIT);
+            
+            if (num_keyframes >= MIN_KF_FOR_IMU_INIT && total_time >= MIN_TIME_FOR_IMU_INIT) {
+                LOG_INFO("IMU initialization conditions met! ({} KFs, {:.2f}s)",
+                         num_keyframes, total_time);
+                
+                if (TryInitializeIMU()) {
+                    // === Transition: VISUAL_ONLY -> VIO ===
+                    m_tracking_state = TrackingState::VIO;
+                    m_imu_init_frame_idx = m_current_frame->GetFrameId();  // Store frame index at IMU init
+                    LOG_INFO("IMU Initialization SUCCESS! Transition to VIO state at frame {}.", m_imu_init_frame_idx);
+                }
+            }
+        }
+        
+        result.num_tracked = num_tracked;
+        break;
+    }
+    
+    case TrackingState::VIO: {
+        // =================================================================
+        // State: VIO - Full Visual-Inertial Odometry with IMU prediction
+        // =================================================================
+        int num_tracked = TrackFeatures();
+        
+        // Link MapPoints from previous frame
+        LinkMapPointsFromPreviousFrame();
+        
+        // Count valid MapPoints
+        int valid_mp_count = 0;
+        const auto& features = m_current_frame->GetFeatures();
+        for (size_t j = 0; j < features.size(); ++j) {
+            auto mp = m_current_frame->GetMapPoint(static_cast<int>(j));
+            if (mp && !mp->IsBad()) {
+                valid_mp_count++;
+            }
+        }
+        
+        // IMU-aided pose prediction
+        bool imu_predicted = PredictStateWithIMU();
+        
+        // Store IMU-predicted pose for comparison
+        Eigen::Matrix4f imu_predicted_pose = Eigen::Matrix4f::Identity();
+        Eigen::Vector3f imu_predicted_velocity = Eigen::Vector3f::Zero();
+        
+        if (!imu_predicted) {
+            // Fallback to constant velocity model
+            if (m_transform_from_last.isIdentity(1e-6)) {
+                m_current_frame->SetTwb(m_previous_frame->GetTwb());
+            } else {
+                Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
+                m_current_frame->SetTwb(predicted_pose);
+            }
+        } else {
+            // Save IMU prediction for logging
+            imu_predicted_pose = m_current_frame->GetTwb();
+            imu_predicted_velocity = m_current_frame->GetVelocity();
+        }
+        
+        // PnP pose estimation
+        if (valid_mp_count >= 6) {
+            Optimizer optimizer;
+            optimizer.SetCamera(m_camera, m_boundary_margin);
+            PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
+            
+            if (pnp_result.success) {
+                if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
+                    m_current_frame->SetReferenceKeyframe(m_last_keyframe);
+                }
+                
+                m_current_pose = m_current_frame->GetTwb();
+                m_transform_from_last = m_previous_frame->GetTwb().inverse() * m_current_pose;
+                result.success = true;
+                
+                // Log IMU prediction vs PnP result
+                if (imu_predicted) {
+                    Eigen::Matrix4f pnp_pose = m_current_frame->GetTwb();
+                    
+                    // Position error
+                    Eigen::Vector3f imu_pos = imu_predicted_pose.block<3,1>(0,3);
+                    Eigen::Vector3f pnp_pos = pnp_pose.block<3,1>(0,3);
+                    float pos_error = (imu_pos - pnp_pos).norm();
+                    
+                    // Rotation error (angle in degrees)
+                    Eigen::Matrix3f imu_R = imu_predicted_pose.block<3,3>(0,0);
+                    Eigen::Matrix3f pnp_R = pnp_pose.block<3,3>(0,0);
+                    Eigen::Matrix3f R_err = imu_R.transpose() * pnp_R;
+                    Eigen::AngleAxisf aa(R_err);
+                    float rot_error_deg = aa.angle() * 180.0f / M_PI;
+                    
+                    LOG_INFO("Frame {}: pos_err={:.4f}m, rot_err={:.3f}deg",
+                             m_current_frame->GetFrameId(), pos_error, rot_error_deg);
+                }
+            } else {
+                LOG_WARN("Frame {}: PnP failed in VIO", m_current_frame->GetFrameId());
+                result.success = false;
+            }
+        } else {
+            LOG_WARN("Frame {}: Not enough MapPoints ({}) for PnP", 
+                     m_current_frame->GetFrameId(), valid_mp_count);
+            result.success = false;
+        }
+        
+        // Detect new features if needed
+        if (m_current_frame->GetFeatureCount() < 100) {
+            DetectFeatures();
+        }
+        
+        // Parallax-based keyframe creation (after IMU init)
         if (ShouldCreateKeyframe()) {
             CreateKeyframe();
         }
         
         result.num_tracked = num_tracked;
+        break;
     }
+    }  // end switch
     
     // Update state
     result.pose = m_current_pose;
@@ -427,7 +566,7 @@ void Estimator::ProcessIMU(const std::vector<IMUData>& imu_data) {
 }
 
 bool Estimator::PredictStateWithIMU() {
-    if (!m_imu_initialized || !m_current_frame || !m_previous_frame) {
+    if (m_tracking_state != TrackingState::VIO || !m_current_frame || !m_previous_frame) {
         return false;
     }
     
@@ -548,20 +687,27 @@ void Estimator::Reset() {
     m_last_keyframe = nullptr;
     m_all_frames.clear();
     m_keyframes.clear();
+    m_all_keyframes.clear();
     m_frame_window.clear();
     m_frame_id_counter = 0;
-    m_initialized = false;
+    m_tracking_state = TrackingState::NOT_INITIALIZED;
+    m_first_keyframe_time = -1.0;
+    m_last_keyframe_time = -1.0;
     m_current_pose = Eigen::Matrix4f::Identity();
     m_transform_from_last = Eigen::Matrix4f::Identity();
+    m_gravity = Eigen::Vector3f(0, 0, -9.81f);
+    m_gyro_bias = Eigen::Vector3f::Zero();
+    m_accel_bias = Eigen::Vector3f::Zero();
+    m_scale = 1.0;
+    m_imu_since_last_keyframe.clear();
 }
 
 std::shared_ptr<Frame> Estimator::CreateFrame(const cv::Mat& image, double timestamp) {
     const auto& config = ConfigUtils::GetInstance();
     
-    // Frame constructor: timestamp (long long in nanoseconds), frame_id, image, width, height
-    long long timestamp_ns = static_cast<long long>(timestamp * 1e9);
+    // Frame constructor: timestamp (double in seconds), frame_id, image, width, height
     auto frame = std::make_shared<Frame>(
-        timestamp_ns,
+        timestamp,
         m_frame_id_counter++,
         image,
         config.camera_width,
@@ -579,7 +725,7 @@ std::shared_ptr<Frame> Estimator::CreateFrame(const cv::Mat& image, double times
     frame->SetTBC(config.T_BC);
     
     // Copy bias from previous frame (after IMU initialization)
-    if (m_imu_initialized && m_previous_frame) {
+    if (m_tracking_state == TrackingState::VIO && m_previous_frame) {
         frame->SetGyroBias(m_previous_frame->GetGyroBias());
         frame->SetAccelBias(m_previous_frame->GetAccelBias());
     }
@@ -765,25 +911,17 @@ void Estimator::CreateKeyframe() {
         optimizer.SetCamera(m_camera, m_boundary_margin);
         
         BAResult ba_result;
-        if (m_imu_initialized) {
-            // Visual-only BA for now (VIBA disabled for debugging)
-            ba_result = optimizer.RunLocalBA(m_keyframes);
+        if (m_tracking_state == TrackingState::VIO) {
+            // Visual-Inertial BA with individual bias per frame
+            ba_result = optimizer.RunLocalBAwithInertial(m_keyframes, m_gravity);
             
-            // // Visual-Inertial BA after IMU initialization
-            // ba_result = optimizer.RunVIBA(m_keyframes, m_gravity, true);
+            // Get updated bias from last keyframe
+            auto last_kf = m_keyframes.back();
+            Eigen::Vector3f new_gyro_bias = last_kf->GetGyroBias();
+            Eigen::Vector3f new_accel_bias = last_kf->GetAccelBias();
             
-            // // Get updated bias from last keyframe
-            // auto last_kf = m_keyframes.back();
-            // Eigen::Vector3f new_gyro_bias = last_kf->GetGyroBias();
-            // Eigen::Vector3f new_accel_bias = last_kf->GetAccelBias();
-            
-            // LOG_INFO("VIBA KF{}: bg=[{:.6f},{:.6f},{:.6f}] ba=[{:.6f},{:.6f},{:.6f}]",
-            //          last_kf->GetFrameId(),
-            //          new_gyro_bias.x(), new_gyro_bias.y(), new_gyro_bias.z(),
-            //          new_accel_bias.x(), new_accel_bias.y(), new_accel_bias.z());
-            
-            // // Update all preintegrations with new bias
-            // UpdatePreintegrationsWithNewBias(new_gyro_bias, new_accel_bias);
+            // Update all preintegrations with new bias
+            UpdatePreintegrationsWithNewBias(new_gyro_bias, new_accel_bias);
         } else {
             // Visual-only Local BA before IMU initialization
             ba_result = optimizer.RunLocalBA(m_keyframes);
@@ -797,10 +935,8 @@ void Estimator::CreateKeyframe() {
         m_transform_from_last = Eigen::Matrix4f::Identity();
     }
     
-    // Try IMU initialization after VO is initialized and we have enough keyframes
-    if (m_initialized && !m_imu_initialized && m_keyframes.size() >= 3) {
-        TryInitializeIMU();
-    }
+    // Note: IMU initialization is now handled in ProcessFrame VISUAL_ONLY state
+    // with ORB-SLAM3 style conditions (10 KF, 2 seconds)
 }
 
 void Estimator::LinkMapPointsFromPreviousFrame() {
@@ -842,6 +978,8 @@ void Estimator::LinkMapPointsFromPreviousFrame() {
     LOG_DEBUG("LinkMapPoints: prev had {} MPs, linked {} to current frame", prev_with_mp, linked_count);
 }
 
+// DEPRECATED: This function was used for interpolation-based initialization.
+// ORB-SLAM3 style uses real tracking instead. Kept for reference but not called.
 void Estimator::ProcessIntermediateFrames() {
     if (m_frame_window.size() < 3) {
         return;  // No intermediate frames
@@ -1319,7 +1457,7 @@ int Estimator::TriangulateNewMapPoints(
 
 bool Estimator::TryInitializeIMU() {
     // Already initialized?
-    if (m_imu_initialized) {
+    if (m_tracking_state == TrackingState::VIO) {
         return true;
     }
     
@@ -1361,6 +1499,11 @@ bool Estimator::TryInitializeIMU() {
     m_gyro_bias = result.gyro_bias;
     m_accel_bias = result.accel_bias;
     
+    // Apply scaled poses from optimizer (ORB-SLAM3 style: scale applied internally)
+    for (size_t i = 0; i < m_keyframes.size() && i < result.scaled_poses.size(); ++i) {
+        m_keyframes[i]->SetTwb(result.scaled_poses[i]);
+    }
+    
     // Update velocities and biases in keyframes (before transformation)
     for (size_t i = 0; i < m_keyframes.size() && i < result.velocities.size(); ++i) {
         m_keyframes[i]->SetVelocity(result.velocities[i]);
@@ -1388,12 +1531,329 @@ bool Estimator::TryInitializeIMU() {
     
     // Apply gravity alignment transformation to world coordinate system
     // This transforms all poses, MapPoints, and velocities so gravity points in -Z
-    ApplyGravityAlignmentTransform(result.Rwg, static_cast<float>(result.scale));
+    // Note: Scale already applied in Optimizer, so pass 1.0 here
+    ApplyGravityAlignmentTransform(result.Rwg, 1.0f);
     
     // Update gravity to point in -Z direction (after transformation)
     m_gravity = Eigen::Vector3f(0.0f, 0.0f, -9.81f);
     
-    m_imu_initialized = true;
+    // Note: m_tracking_state transition to VIO is done in ProcessFrame after TryInitializeIMU returns true
+    
+    return true;
+}
+
+bool Estimator::TryInitializeIMUWithInterpolation() {
+    // =========================================================================
+    // Interpolation-Based IMU Initialization
+    // Uses intermediate frames between first two keyframes with interpolated poses
+    // =========================================================================
+    
+    if (m_tracking_state == TrackingState::VIO) {
+        return true;  // Already initialized
+    }
+    
+    // Need at least 2 keyframes (first and last from frame_window)
+    if (m_keyframes.size() < 2) {
+        LOG_INFO("[IMU_INIT_INTERP] Need at least 2 keyframes, got {}", m_keyframes.size());
+        return false;
+    }
+    
+    // Check if we have intermediate frames in frame_window
+    if (m_frame_window.size() < 3) {
+        LOG_INFO("[IMU_INIT_INTERP] Need intermediate frames in window, got {}", m_frame_window.size());
+        return false;
+    }
+    
+    // Get first and last keyframes
+    auto kf1 = m_frame_window.front();  // First keyframe
+    auto kf2 = m_frame_window.back();   // Last keyframe
+    
+    Eigen::Matrix4f T1 = kf1->GetTwb();
+    Eigen::Matrix4f T2 = kf2->GetTwb();
+    
+    // Extract rotation and translation
+    Eigen::Matrix3f R1 = T1.block<3,3>(0,0);
+    Eigen::Vector3f t1 = T1.block<3,1>(0,3);
+    Eigen::Matrix3f R2 = T2.block<3,3>(0,0);
+    Eigen::Vector3f t2 = T2.block<3,1>(0,3);
+    
+    // Relative rotation for interpolation
+    Eigen::Matrix3f R_rel = R1.transpose() * R2;
+    Eigen::AngleAxisf aa(R_rel);
+    Eigen::Vector3f axis = aa.axis();
+    float angle = aa.angle();
+    
+    int n_frames = static_cast<int>(m_frame_window.size());
+    
+    LOG_INFO("========================================================");
+    LOG_INFO("[IMU_INIT_INTERP] Interpolation-Based IMU Initialization");
+    LOG_INFO("  Total frames: {}, KF1 id: {}, KF2 id: {}",
+             n_frames, kf1->GetFrameId(), kf2->GetFrameId());
+    LOG_INFO("========================================================");
+    
+    // =========================================================================
+    // STEP 1: Interpolate poses for intermediate frames
+    // =========================================================================
+    
+    double total_dt = kf2->GetTimestamp() - kf1->GetTimestamp();
+    if (total_dt < 0.01) {
+        LOG_WARN("[IMU_INIT_INTERP] Time span too short: {:.3f}s", total_dt);
+        return false;
+    }
+    
+    std::vector<Eigen::Matrix4f> interpolated_poses(n_frames);
+    std::vector<double> frame_times(n_frames);
+    
+    interpolated_poses[0] = T1;
+    frame_times[0] = kf1->GetTimestamp();
+    
+    for (int i = 1; i < n_frames - 1; ++i) {
+        auto& frame = m_frame_window[i];
+        double t_frame = frame->GetTimestamp();
+        float alpha = static_cast<float>((t_frame - kf1->GetTimestamp()) / total_dt);
+        alpha = std::max(0.0f, std::min(1.0f, alpha));
+        
+        // SLERP for rotation
+        float interp_angle = alpha * angle;
+        Eigen::Matrix3f R_interp = R1 * Eigen::AngleAxisf(interp_angle, axis).toRotationMatrix();
+        
+        // LERP for translation
+        Eigen::Vector3f t_interp = (1.0f - alpha) * t1 + alpha * t2;
+        
+        Eigen::Matrix4f T_interp = Eigen::Matrix4f::Identity();
+        T_interp.block<3,3>(0,0) = R_interp;
+        T_interp.block<3,1>(0,3) = t_interp;
+        
+        interpolated_poses[i] = T_interp;
+        frame_times[i] = t_frame;
+        frame->SetTwb(T_interp);
+    }
+    
+    interpolated_poses[n_frames - 1] = T2;
+    frame_times[n_frames - 1] = kf2->GetTimestamp();
+    
+    LOG_INFO("  Interpolated {} intermediate frame poses", n_frames - 2);
+    
+    // =========================================================================
+    // STEP 2: Compute frame-to-frame preintegrations
+    // =========================================================================
+    
+    std::vector<std::shared_ptr<IMUPreintegration>> preints;
+    std::vector<double> dts;
+    int valid_preint_count = 0;
+    
+    for (int i = 0; i < n_frames - 1; ++i) {
+        auto& frame_i = m_frame_window[i];
+        auto& frame_j = m_frame_window[i + 1];
+        
+        double t_start = frame_times[i];
+        double t_end = frame_times[i + 1];
+        double dt = t_end - t_start;
+        
+        // Look for IMU data for this frame
+        auto it = m_imu_data_per_frame.find(frame_j->GetFrameId());
+        if (it == m_imu_data_per_frame.end() || it->second.empty()) {
+            // Try getting from keyframe preintegration
+            auto kf_preint = frame_j->GetIMUPreintegrationFromLastKeyframe();
+            if (kf_preint && kf_preint->IsValid()) {
+                preints.push_back(kf_preint);
+                dts.push_back(kf_preint->dt_total);
+                valid_preint_count++;
+                continue;
+            }
+            
+            LOG_DEBUG("  Frame {} has no IMU data", frame_j->GetFrameId());
+            preints.push_back(nullptr);
+            dts.push_back(dt);
+            continue;
+        }
+        
+        // Preintegrate for this frame pair
+        Eigen::Vector3f gyro_bias = Eigen::Vector3f::Zero();
+        Eigen::Vector3f accel_bias = Eigen::Vector3f::Zero();
+        m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
+        
+        auto preint = m_imu_preintegrator->Preintegrate(it->second, t_start, t_end);
+        if (preint && preint->IsValid()) {
+            preints.push_back(preint);
+            dts.push_back(preint->dt_total);
+            valid_preint_count++;
+        } else {
+            preints.push_back(nullptr);
+            dts.push_back(dt);
+        }
+    }
+    
+    LOG_INFO("  Valid preintegrations: {} / {}", valid_preint_count, n_frames - 1);
+    
+    if (valid_preint_count < 2) {
+        LOG_WARN("[IMU_INIT_INTERP] Not enough preintegrations for initialization");
+        return false;
+    }
+    
+    // =========================================================================
+    // STEP 3: Gyro Bias Estimation (Rotation-only)
+    // =========================================================================
+    
+    Eigen::Matrix3d A_gyro = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d b_gyro = Eigen::Vector3d::Zero();
+    int gyro_pairs = 0;
+    
+    for (int i = 0; i < n_frames - 1; ++i) {
+        if (!preints[i] || !preints[i]->IsValid()) continue;
+        
+        // Visual rotation: R_ij = R_i^T * R_j
+        Eigen::Matrix3d R_i = interpolated_poses[i].block<3,3>(0,0).cast<double>();
+        Eigen::Matrix3d R_j = interpolated_poses[i+1].block<3,3>(0,0).cast<double>();
+        Eigen::Matrix3d R_ij_visual = R_i.transpose() * R_j;
+        
+        // IMU rotation
+        Eigen::Matrix3d delta_R_imu = preints[i]->delta_R.cast<double>();
+        
+        // Rotation error
+        Eigen::Matrix3d R_err = delta_R_imu.transpose() * R_ij_visual;
+        Eigen::AngleAxisd aa_err(R_err);
+        Eigen::Vector3d rotation_error = aa_err.angle() * aa_err.axis();
+        
+        // Jacobian
+        Eigen::Matrix3d J_Rg = preints[i]->J_Rg.cast<double>();
+        
+        A_gyro += J_Rg.transpose() * J_Rg;
+        b_gyro += J_Rg.transpose() * rotation_error;
+        gyro_pairs++;
+    }
+    
+    Eigen::Vector3d gyro_bias_est = Eigen::Vector3d::Zero();
+    if (gyro_pairs > 0 && A_gyro.determinant() > 1e-10) {
+        gyro_bias_est = A_gyro.ldlt().solve(b_gyro);
+    }
+    
+    m_gyro_bias = gyro_bias_est.cast<float>();
+    LOG_INFO("  Gyro bias: [{:.6f}, {:.6f}, {:.6f}] rad/s ({} pairs)",
+             m_gyro_bias.x(), m_gyro_bias.y(), m_gyro_bias.z(), gyro_pairs);
+    
+    // =========================================================================
+    // STEP 4: Gravity Direction Estimation (ORB-SLAM3 style)
+    // Use delta_V from preintegration: delta_V = R_i^T * (v_j - v_i - g * dt)
+    // Rearranging: R_i * delta_V = v_j - v_i - g * dt
+    // Sum over all frames: gravity direction is -sum(R_i * delta_V) / sum(dt)
+    // =========================================================================
+    
+    Eigen::Vector3d dirG = Eigen::Vector3d::Zero();
+    double total_dt_gravity = 0.0;
+    int gravity_samples = 0;
+    
+    for (int i = 0; i < n_frames - 1; ++i) {
+        if (!preints[i] || !preints[i]->IsValid()) continue;
+        
+        double dt = preints[i]->dt_total;
+        if (dt < 0.001) continue;
+        
+        Eigen::Matrix3d R_i = interpolated_poses[i].block<3,3>(0,0).cast<double>();
+        
+        // Corrected delta_V with gyro bias
+        Eigen::Vector3d delta_V = preints[i]->delta_V.cast<double>();
+        Eigen::Matrix3d J_Vg = preints[i]->J_Vg.cast<double>();
+        delta_V += J_Vg * gyro_bias_est;
+        
+        // ORB-SLAM3: dirG = -sum(R_i * delta_V)
+        // This accumulates the acceleration direction
+        dirG -= R_i * delta_V;
+        total_dt += dt;
+        gravity_samples++;
+    }
+    
+    if (gravity_samples == 0 || total_dt < 0.01) {
+        LOG_WARN("[IMU_INIT_INTERP] No valid samples for gravity estimation");
+        return false;
+    }
+    
+    // ORB-SLAM3 style: gravity direction from accumulated delta_V
+    // dirG points in the gravity direction (scaled by time)
+    Eigen::Vector3d gravity_dir = dirG / total_dt;  // Average acceleration
+    double gravity_norm = gravity_dir.norm();
+    
+    LOG_INFO("  Raw gravity: [{:.4f}, {:.4f}, {:.4f}] (norm={:.4f})",
+             gravity_dir.x(), gravity_dir.y(), gravity_dir.z(), gravity_norm);
+    
+    // Normalize to 9.81
+    if (gravity_norm > 0.1) {
+        gravity_dir = gravity_dir.normalized() * 9.81;
+    } else {
+        gravity_dir = Eigen::Vector3d(0, 0, -9.81);  // Default
+    }
+    
+    m_gravity = gravity_dir.cast<float>();
+    
+    // =========================================================================
+    // STEP 6: Compute gravity alignment rotation (Rwg)
+    // =========================================================================
+    
+    Eigen::Vector3d gz(0, 0, -1);  // Target gravity direction
+    Eigen::Vector3d gn = gravity_dir.normalized();
+    
+    Eigen::Matrix3d Rwg = Eigen::Matrix3d::Identity();
+    double dot = gz.dot(gn);
+    
+    if (std::abs(dot + 1.0) < 1e-6) {
+        // Anti-parallel: rotate 180° around any perpendicular axis
+        Rwg = Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    } else if (std::abs(dot - 1.0) > 1e-6) {
+        // General case: use Rodrigues
+        Eigen::Vector3d axis = gn.cross(gz);
+        double axis_norm = axis.norm();
+        if (axis_norm > 1e-6) {
+            axis.normalize();
+            double angle = std::acos(std::max(-1.0, std::min(1.0, dot)));
+            Rwg = Eigen::AngleAxisd(angle, axis).toRotationMatrix();
+        }
+    }
+    
+    // =========================================================================
+    // STEP 6: Apply results to keyframes
+    // =========================================================================
+    
+    // Set initial velocities (will be refined by VIBA)
+    // Estimate velocity from position change
+    Eigen::Vector3f t1_pos = kf1->GetTwb().block<3,1>(0,3);
+    Eigen::Vector3f t2_pos = kf2->GetTwb().block<3,1>(0,3);
+    float dt_vel = static_cast<float>(kf2->GetTimestamp() - kf1->GetTimestamp());
+    Eigen::Vector3f avg_velocity = Eigen::Vector3f::Zero();
+    if (dt_vel > 0.001f) {
+        avg_velocity = (t2_pos - t1_pos) / dt_vel;
+    }
+    
+    m_keyframes[0]->SetVelocity(avg_velocity);
+    m_keyframes[1]->SetVelocity(avg_velocity);
+    
+    // Set biases
+    for (auto& kf : m_keyframes) {
+        kf->SetGyroBias(m_gyro_bias);
+        kf->SetAccelBias(Eigen::Vector3f::Zero());  // Accel bias not estimated yet
+    }
+    
+    m_accel_bias = Eigen::Vector3f::Zero();
+    m_scale = 1.0;  // Scale already applied in visual init
+    
+    // Update preintegrator bias
+    m_imu_preintegrator->SetBias(m_gyro_bias, m_accel_bias);
+    
+    if (m_current_frame) {
+        m_current_frame->SetGyroBias(m_gyro_bias);
+        m_current_frame->SetAccelBias(m_accel_bias);
+    }
+    
+    LOG_INFO("[IMU_INIT_INTERP] IMU initialization SUCCESS!");
+    LOG_INFO("  Gravity: [{:.4f}, {:.4f}, {:.4f}]",
+             m_gravity.x(), m_gravity.y(), m_gravity.z());
+    LOG_INFO("  Gyro bias: [{:.6f}, {:.6f}, {:.6f}]",
+             m_gyro_bias.x(), m_gyro_bias.y(), m_gyro_bias.z());
+    
+    // Apply gravity alignment transformation
+    ApplyGravityAlignmentTransform(Rwg.cast<float>(), 1.0f);
+    
+    // Update gravity to point in -Z direction (after transformation)
+    m_gravity = Eigen::Vector3f(0.0f, 0.0f, -9.81f);
     
     return true;
 }

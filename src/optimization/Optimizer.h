@@ -68,8 +68,9 @@ struct IMUInitResult {
     bool success;
     Eigen::Vector3f gravity;              // Estimated gravity direction in world frame (before transform)
     Eigen::Matrix3f Rwg;                   // Rotation from world to gravity-aligned frame
-    double scale;                          // Estimated scale (monocular)
-    std::vector<Eigen::Vector3f> velocities; // Estimated velocities for each frame (before transform)
+    double scale;                          // Estimated scale (monocular) - already applied to poses
+    std::vector<Eigen::Matrix4f> scaled_poses;  // Scaled poses (scale already applied)
+    std::vector<Eigen::Vector3f> velocities; // Estimated velocities for each frame (scale applied)
     Eigen::Vector3f gyro_bias;             // Estimated gyro bias
     Eigen::Vector3f accel_bias;            // Estimated accel bias
     double initial_cost;
@@ -159,8 +160,21 @@ public:
      * @return BA optimization result
      */
     BAResult RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
-                     const Eigen::Vector3f& gravity,
                      bool fix_first_pose = true);
+    
+    /**
+     * @brief Run Local Bundle Adjustment with Inertial factors
+     * 
+     * Based on RunLocalBA, but adds IMU preintegration constraints between consecutive keyframes.
+     * Optimizes poses, velocities, biases, and MapPoints jointly.
+     * Uses InertialFactorFixedGravity with fixed gravity direction.
+     * 
+     * @param window_frames Vector of frames in the sliding window
+     * @param gravity Gravity vector in world frame (after IMU init alignment)
+     * @return BA optimization result
+     */
+    BAResult RunLocalBAwithInertial(const std::vector<std::shared_ptr<Frame>>& window_frames,
+                                    const Eigen::Vector3f& gravity);
     
     // ============ IMU Initialization ============
     
@@ -196,6 +210,16 @@ private:
      * @brief Check if a feature is near horizontal boundary
      */
     bool IsNearBoundary(const cv::Point2f& pixel) const;
+    
+    /**
+     * @brief Compute scale metric for IMU initialization
+     */
+    double ComputeScaleMetric(const IMUInitResult& result, double scale);
+    
+    /**
+     * @brief Optimize IMU initialization with a specific scale
+     */
+    IMUInitResult OptimizeIMUInitWithScale(const std::vector<std::shared_ptr<Frame>>& frames, double initial_scale);
     
     // Parameters
     double m_huber_delta;         // Huber loss delta

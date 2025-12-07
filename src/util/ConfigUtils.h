@@ -97,6 +97,7 @@ public:
     float imu_accel_noise;
     float imu_gyro_bias_noise;
     float imu_accel_bias_noise;
+    float imu_gravity_magnitude;
     
 private:
     ConfigUtils();

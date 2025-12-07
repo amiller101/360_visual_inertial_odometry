@@ -16,7 +16,7 @@
 
 namespace vio_360 {
 
-Frame::Frame(long long timestamp, int frame_id, const cv::Mat& image, int width, int height)
+Frame::Frame(double timestamp, int frame_id, const cv::Mat& image, int width, int height)
     : m_timestamp(timestamp)
     , m_frame_id(frame_id)
     , m_image(image.clone())

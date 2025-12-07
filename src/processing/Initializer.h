@@ -36,15 +36,13 @@ struct InitializationResult {
     // Initialized keyframes and map points (like lightweight_vio)
     std::vector<std::shared_ptr<Frame>> initialized_keyframes;
     std::vector<std::shared_ptr<MapPoint>> initialized_mappoints;
-    float scale_factor;                   // Scale factor used (1/median_depth)
     
     InitializationResult() 
         : success(false)
         , R(Eigen::Matrix3f::Identity())
         , t(Eigen::Vector3f::Zero())
         , frame1_id(-1)
-        , frame2_id(-1)
-        , scale_factor(1.0f) {}
+        , frame2_id(-1) {}
 };
 
 /**

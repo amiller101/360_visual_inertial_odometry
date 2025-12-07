@@ -19,6 +19,7 @@
 #include "processing/IMUPreintegrator.h"
 #include "util/Logger.h"
 #include "util/LieUtils.h"
+#include "util/ConfigUtils.h"
 
 #include <set>
 
@@ -332,15 +333,15 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
         return result;
     }
     
-    // Parameter blocks
-    std::vector<std::array<double, 6>> pose_params(frames.size());
-    std::vector<Eigen::Matrix4d> T_wb_inits(frames.size());  // Store initial poses for right perturbation
+    // Parameter blocks for right perturbation
+    std::vector<Eigen::Matrix4d> T_wb_inits(frames.size());  // Store initial poses
+    std::vector<std::array<double, 6>> pose_params(frames.size());  // delta_xi (perturbation from init)
     std::vector<std::array<double, 3>> point_params(mappoints.size());
     
-    // Initialize pose parameters as zero perturbation (right perturbation approach)
+    // Initialize: delta_xi = 0 (right perturbation), store T_wb_init
     for (size_t i = 0; i < frames.size(); ++i) {
         T_wb_inits[i] = frames[i]->GetTwb().cast<double>();
-        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // Zero perturbation
+        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // delta_xi starts at 0
     }
     
     // Initialize point parameters and create index map
@@ -384,7 +385,7 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
             size_t pi = it->second;
             Eigen::Vector2d obs(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
             
-            // Pass initial pose for right perturbation
+            // Right perturbation: pass T_wb_init to factor
             auto* cost = new factor::BAFactor(obs, cam_params, T_cb, T_wb_inits[fi], info);
             factors.push_back(cost);
             factor_indices.push_back({fi, pi});
@@ -457,12 +458,12 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
     
     
     // Update frames and MapPoints
-    // Compute final pose: T_wb = T_wb_init * exp(delta_xi) (right perturbation)
+    // Right Perturbation: T_wb = T_wb_init * exp(delta_xi)
     for (size_t i = 0; i < frames.size(); ++i) {
         Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
-        SE3d T_wb_init_se3(T_wb_inits[i]);
-        SE3d delta_T = SE3d::exp(delta_xi);
-        SE3d T_wb_final = T_wb_init_se3 * delta_T;
+        vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+        vio_360::SE3d T_wb_init_se3(T_wb_inits[i]);
+        vio_360::SE3d T_wb_final = T_wb_init_se3 * delta_T;
         frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
     }
     
@@ -490,19 +491,20 @@ BAResult Optimizer::RunFullBA(const std::vector<std::shared_ptr<Frame>>& frames)
     return RunBA(frames, true, false);
 }
 
-BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
-                            const Eigen::Vector3f& gravity,
-                            bool fix_first_pose) {
+BAResult Optimizer::RunLocalBAwithInertial(const std::vector<std::shared_ptr<Frame>>& window_frames,
+                                            const Eigen::Vector3f& gravity) {
     BAResult result;
     
-    if (frames.size() < 2) {
-        LOG_WARN("RunVIBA: need at least 2 frames");
+    if (window_frames.size() < 2) {
+        LOG_WARN("RunLocalBAwithInertial: need at least 2 frames in window");
         return result;
     }
     
-    // Collect all MapPoints observed by these frames
+    // LOG_INFO("Starting Local BA with Inertial factors ({} frames)", window_frames.size());
+    
+    // ==================== Step 1: Collect MapPoints ====================
     std::set<std::shared_ptr<MapPoint>> mappoint_set;
-    for (const auto& frame : frames) {
+    for (const auto& frame : window_frames) {
         const auto& features = frame->GetFeatures();
         for (size_t i = 0; i < features.size(); ++i) {
             const auto& feature = features[i];
@@ -517,39 +519,52 @@ BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
     std::vector<std::shared_ptr<MapPoint>> mappoints(mappoint_set.begin(), mappoint_set.end());
     
     if (mappoints.empty()) {
-        LOG_WARN("RunVIBA: no valid MapPoints");
+        LOG_WARN("RunLocalBAwithInertial: no valid MapPoints");
         return result;
     }
     
-    // ==================== Parameter blocks ====================
-    // Pose parameters (6D tangent space, right perturbation)
-    std::vector<std::array<double, 6>> pose_params(frames.size());
-    std::vector<Eigen::Matrix4d> T_wb_inits(frames.size());
+    // Create frame index map
+    std::map<std::shared_ptr<Frame>, size_t> frame_to_idx;
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        frame_to_idx[window_frames[i]] = i;
+    }
     
-    // Velocity parameters (3D each frame)
-    std::vector<std::array<double, 3>> velocity_params(frames.size());
+    // ==================== Step 2: Parameter blocks ====================
+    // Pose parameters (6D perturbation, right perturbation: T_wb = T_wb_init * exp(delta_xi))
+    std::vector<Eigen::Matrix4d> T_wb_inits(window_frames.size());
+    std::vector<std::array<double, 6>> pose_params(window_frames.size());
     
-    // Shared bias parameters
-    std::array<double, 3> gyro_bias_params;
-    std::array<double, 3> accel_bias_params;
+    // Velocity parameters (3D per frame)
+    std::vector<std::array<double, 3>> velocity_params(window_frames.size());
+    
+    // Bias parameters (PER FRAME - individual biases)
+    std::vector<std::array<double, 3>> gyro_bias_params(window_frames.size());
+    std::vector<std::array<double, 3>> accel_bias_params(window_frames.size());
+    
+    // Store initial values for priors
+    std::vector<Eigen::Vector3d> velocity_priors(window_frames.size());
+    std::vector<Eigen::Vector3d> gyro_bias_priors(window_frames.size());
+    std::vector<Eigen::Vector3d> accel_bias_priors(window_frames.size());
     
     // Point parameters
     std::vector<std::array<double, 3>> point_params(mappoints.size());
     
-    // Initialize parameters
-    for (size_t i = 0; i < frames.size(); ++i) {
-        T_wb_inits[i] = frames[i]->GetTwb().cast<double>();
-        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // Zero perturbation
+    // Initialize parameters from each frame
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        T_wb_inits[i] = window_frames[i]->GetTwb().cast<double>();
+        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // delta_xi starts at 0
         
-        Eigen::Vector3f vel = frames[i]->GetVelocity();
+        Eigen::Vector3f vel = window_frames[i]->GetVelocity();
         velocity_params[i] = {vel.x(), vel.y(), vel.z()};
+        velocity_priors[i] = vel.cast<double>();
+        
+        Eigen::Vector3f gb = window_frames[i]->GetGyroBias();
+        Eigen::Vector3f ab = window_frames[i]->GetAccelBias();
+        gyro_bias_params[i] = {gb.x(), gb.y(), gb.z()};
+        accel_bias_params[i] = {ab.x(), ab.y(), ab.z()};
+        gyro_bias_priors[i] = gb.cast<double>();
+        accel_bias_priors[i] = ab.cast<double>();
     }
-    
-    // Initialize bias from first frame
-    Eigen::Vector3f gb = frames[0]->GetGyroBias();
-    Eigen::Vector3f ab = frames[0]->GetAccelBias();
-    gyro_bias_params = {gb.x(), gb.y(), gb.z()};
-    accel_bias_params = {ab.x(), ab.y(), ab.z()};
     
     // Initialize point parameters
     std::map<std::shared_ptr<MapPoint>, size_t> mp_to_idx;
@@ -559,39 +574,43 @@ BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
         mp_to_idx[mappoints[i]] = i;
     }
     
-    // ==================== Build optimization problem ====================
+    // ==================== Step 3: Build optimization problem ====================
     ceres::Problem problem;
     std::vector<factor::BAFactor*> ba_factors;
     std::vector<std::pair<size_t, size_t>> ba_factor_indices;  // (frame_idx, mp_idx)
     
-    // Add visual factors (BAFactor)
-    for (size_t fi = 0; fi < frames.size(); ++fi) {
-        const auto& frame = frames[fi];
+    // Add visual factors (BAFactor with right perturbation)
+    for (size_t pi = 0; pi < mappoints.size(); ++pi) {
+        const auto& mp = mappoints[pi];
+        const auto& observations = mp->GetObservations();
         
-        double cols = static_cast<double>(frame->GetWidth());
-        double rows = static_cast<double>(frame->GetHeight());
-        factor::CameraParameters cam_params(cols, rows);
-        
-        Eigen::Matrix4d T_cb = frame->GetTCB().cast<double>();
-        Eigen::Matrix2d info = Eigen::Matrix2d::Identity() / (m_pixel_noise_std * m_pixel_noise_std);
-        
-        const auto& features = frame->GetFeatures();
-        for (size_t i = 0; i < features.size(); ++i) {
-            const auto& feature = features[i];
-            if (!feature || !feature->IsValid()) continue;
+        for (const auto& obs : observations) {
+            auto obs_frame = obs.frame.lock();
+            if (!obs_frame) continue;
             
-            auto mp = frame->GetMapPoint(static_cast<int>(i));
-            if (!mp || mp->IsBad()) continue;
+            auto frame_it = frame_to_idx.find(obs_frame);
+            if (frame_it == frame_to_idx.end()) continue;
+            
+            size_t fi = frame_it->second;
+            
+            const auto& features = obs_frame->GetFeatures();
+            if (obs.feature_index < 0 || obs.feature_index >= static_cast<int>(features.size())) continue;
+            
+            const auto& feature = features[obs.feature_index];
+            if (!feature || !feature->IsValid()) continue;
             
             if (IsNearBoundary(feature->GetPixelCoord())) continue;
             
-            auto it = mp_to_idx.find(mp);
-            if (it == mp_to_idx.end()) continue;
+            double cols = static_cast<double>(obs_frame->GetWidth());
+            double rows = static_cast<double>(obs_frame->GetHeight());
+            factor::CameraParameters cam_params(cols, rows);
             
-            size_t pi = it->second;
-            Eigen::Vector2d obs(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
+            Eigen::Matrix4d T_cb = obs_frame->GetTCB().cast<double>();
+            Eigen::Matrix2d info = Eigen::Matrix2d::Identity() / (m_pixel_noise_std * m_pixel_noise_std);
             
-            auto* cost = new factor::BAFactor(obs, cam_params, T_cb, T_wb_inits[fi], info);
+            Eigen::Vector2d obs_pixel(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
+            
+            auto* cost = new factor::BAFactor(obs_pixel, cam_params, T_cb, T_wb_inits[fi], info);
             ba_factors.push_back(cost);
             ba_factor_indices.push_back({fi, pi});
             
@@ -604,48 +623,131 @@ BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
         }
     }
     
-    // Add IMU factors (InertialFactor between consecutive keyframes)
-    // Gravity direction is fixed (already aligned to -Z)
-    Eigen::Vector3d g_world = gravity.cast<double>();
+    // Add IMU factors between consecutive keyframes (InertialFactorFixedGravity)
+    // Uses individual biases per frame (8 parameter blocks)
+    Eigen::Vector3d gravity_d = gravity.cast<double>();
+    int imu_factor_count = 0;
     
-    for (size_t i = 1; i < frames.size(); ++i) {
-        auto preint = frames[i]->GetIMUPreintegrationFromLastKeyframe();
+    for (size_t i = 0; i < window_frames.size() - 1; ++i) {
+        auto preint = window_frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
         if (!preint) {
-            LOG_WARN("RunVIBA: Frame {} missing IMU preintegration", frames[i]->GetFrameId());
+            LOG_WARN("RunLocalBAwithInertial: No IMU preintegration for frame {}", i + 1);
             continue;
         }
         
-        // Create fixed-gravity inertial factor
         auto* imu_cost = new factor::InertialFactorFixedGravity(
-            preint, g_world, T_wb_inits[i-1], T_wb_inits[i]);
+            preint, gravity_d, T_wb_inits[i], T_wb_inits[i + 1]);
         
+        // Pass both frame_i and frame_j bias (8 parameter blocks)
+        // Preintegration uses frame_i's bias for correction
         problem.AddResidualBlock(
             imu_cost,
             nullptr,  // No robust loss for IMU
-            pose_params[i-1].data(),    // pose_i
-            velocity_params[i-1].data(), // velocity_i
-            gyro_bias_params.data(),     // shared gyro bias
-            accel_bias_params.data(),    // shared accel bias
-            pose_params[i].data(),       // pose_j
-            velocity_params[i].data()    // velocity_j
+            pose_params[i].data(),
+            velocity_params[i].data(),
+            gyro_bias_params[i].data(),      // bias for frame i
+            accel_bias_params[i].data(),     // bias for frame i
+            pose_params[i + 1].data(),
+            velocity_params[i + 1].data(),
+            gyro_bias_params[i + 1].data(),  // bias for frame j
+            accel_bias_params[i + 1].data()  // bias for frame j
         );
+        imu_factor_count++;
     }
     
-    // Fix first pose if requested
-    if (fix_first_pose && !frames.empty()) {
-        problem.SetParameterBlockConstant(pose_params[0].data());
+    LOG_DEBUG("  Added {} IMU factors", imu_factor_count);
+    
+    // Add bias consistency factors between consecutive frames
+    // This ensures bias doesn't change too rapidly between frames
+    const double bias_consistency_weight = 100.0;  // Very strong consistency constraint
+    for (size_t i = 0; i < window_frames.size() - 1; ++i) {
+        // Gyro bias consistency
+        auto* gyro_consistency = new factor::BiasConsistencyFactor(bias_consistency_weight);
+        problem.AddResidualBlock(gyro_consistency, nullptr,
+                                gyro_bias_params[i].data(),
+                                gyro_bias_params[i + 1].data());
+        
+        // Accel bias consistency
+        auto* accel_consistency = new factor::BiasConsistencyFactor(bias_consistency_weight);
+        problem.AddResidualBlock(accel_consistency, nullptr,
+                                accel_bias_params[i].data(),
+                                accel_bias_params[i + 1].data());
     }
     
-    // ==================== Solve ====================
+    LOG_DEBUG("  Added {} bias consistency factors", 2 * (window_frames.size() - 1));
+    
+    // Add velocity and bias priors with UNIFORM strong weight for all frames
+    const size_t n_frames = window_frames.size();
+    const double velocity_prior_weight = 10.0;   // Moderate velocity prior
+    const double bias_prior_weight = 1000.0;     // Very strong bias prior to prevent large jumps
+    
+    for (size_t i = 0; i < n_frames; ++i) {
+        // Velocity prior
+        auto* vel_prior = new factor::BiasPriorFactor(velocity_priors[i], velocity_prior_weight);
+        problem.AddResidualBlock(vel_prior, nullptr, velocity_params[i].data());
+        
+        // Gyro bias prior
+        auto* gyro_prior = new factor::BiasPriorFactor(gyro_bias_priors[i], bias_prior_weight);
+        problem.AddResidualBlock(gyro_prior, nullptr, gyro_bias_params[i].data());
+        
+        // Accel bias prior
+        auto* accel_prior = new factor::BiasPriorFactor(accel_bias_priors[i], bias_prior_weight);
+        problem.AddResidualBlock(accel_prior, nullptr, accel_bias_params[i].data());
+    }
+    
+    LOG_DEBUG("  Added priors: uniform weight vel={:.2f} bias={:.2f} for all {} frames",
+             velocity_prior_weight, bias_prior_weight, n_frames);
+    
+    // ==================== Step 4: Fix constraints ====================
+    std::set<size_t> poses_in_problem;
+    for (const auto& [fi, pi] : ba_factor_indices) {
+        poses_in_problem.insert(fi);
+    }
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        poses_in_problem.insert(i);
+    }
+    
+    // Fix first keyframe pose for scale stability
+    constexpr size_t NUM_FIXED_KEYFRAMES = 1;
+    int fixed_count = 0;
+    int optimized_count = 0;
+    
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        if (poses_in_problem.count(i) == 0) continue;
+        
+        if (i < NUM_FIXED_KEYFRAMES) {
+            problem.SetParameterBlockConstant(pose_params[i].data());
+            fixed_count++;
+        } else {
+            optimized_count++;
+        }
+    }
+    
+    // Fix marginalized MapPoints
+    int fixed_mp_count = 0;
+    int optimized_mp_count = 0;
+    for (size_t i = 0; i < mappoints.size(); ++i) {
+        if (mappoints[i]->IsMarginalized()) {
+            problem.SetParameterBlockConstant(point_params[i].data());
+            fixed_mp_count++;
+        } else {
+            optimized_mp_count++;
+        }
+    }
+    
+    LOG_DEBUG("  LocalBA+I: {} frames (fix {}, opt {}), {} MPs ({} fixed, {} opt), {} visual, {} IMU",
+             window_frames.size(), fixed_count, optimized_count, 
+             mappoints.size(), fixed_mp_count, optimized_mp_count, 
+             ba_factors.size(), imu_factor_count);
+    
+    // ==================== Step 5: Solve ====================
     ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     
-    LOG_INFO("VIBA: iterations={}, cost {:.4f} -> {:.4f}", 
-             summary.iterations.size(), summary.initial_cost, summary.final_cost);
-    
-    // ==================== Outlier detection ====================
+    // ==================== Step 6: Outlier detection ====================
+    constexpr double chi_sq_threshold = 5.99146;
     int num_inliers = 0;
     int num_outliers = 0;
     
@@ -659,7 +761,7 @@ BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
         const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
         double chi2 = ba_factors[i]->compute_chi_square(params);
         
-        bool is_outlier = (chi2 > 5.991);
+        bool is_outlier = (chi2 > chi_sq_threshold);
         ba_factors[i]->set_outlier(is_outlier);
         
         if (is_outlier) {
@@ -672,56 +774,437 @@ BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
     }
     
     // Mark bad MapPoints
+    int bad_mp_count = 0;
     for (const auto& mp : mappoints) {
         if (mp->IsMarginalized()) continue;
         int inliers = mp_inlier_count[mp];
         int outliers = mp_outlier_count[mp];
         if (inliers == 0 && outliers >= 2) {
             mp->SetBad();
+            bad_mp_count++;
         }
     }
     
-    // ==================== Update results ====================
-    // Update poses
-    for (size_t i = 0; i < frames.size(); ++i) {
-        Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
-        SE3d T_wb_init_se3(T_wb_inits[i]);
-        SE3d delta_T = SE3d::exp(delta_xi);
-        SE3d T_wb_final = T_wb_init_se3 * delta_T;
-        frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
-        
-        // Update velocity
-        Eigen::Vector3f vel(velocity_params[i][0], velocity_params[i][1], velocity_params[i][2]);
-        frames[i]->SetVelocity(vel);
+    if (bad_mp_count > 0) {
+        LOG_DEBUG("  LocalBA+I: marked {} MapPoints as bad", bad_mp_count);
     }
     
-    // Update biases for all frames
-    Eigen::Vector3f new_gyro_bias(gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
-    Eigen::Vector3f new_accel_bias(accel_bias_params[0], accel_bias_params[1], accel_bias_params[2]);
-    for (auto& frame : frames) {
-        frame->SetGyroBias(new_gyro_bias);
-        frame->SetAccelBias(new_accel_bias);
+    // ==================== Step 7: Update results ====================
+    // Update poses (Right Perturbation: T_wb = T_wb_init * exp(delta_xi))
+    for (size_t i = NUM_FIXED_KEYFRAMES; i < window_frames.size(); ++i) {
+        if (poses_in_problem.count(i) == 0) continue;
+        
+        Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
+        vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+        vio_360::SE3d T_wb_init_se3(T_wb_inits[i]);
+        vio_360::SE3d T_wb_final = T_wb_init_se3 * delta_T;
+        window_frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
+    }
+    
+    // Update velocities
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        Eigen::Vector3f new_vel(velocity_params[i][0], velocity_params[i][1], velocity_params[i][2]);
+        window_frames[i]->SetVelocity(new_vel);
+    }
+    
+    // Update biases (individual per frame)
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        Eigen::Vector3f new_gyro_bias(gyro_bias_params[i][0], gyro_bias_params[i][1], gyro_bias_params[i][2]);
+        Eigen::Vector3f new_accel_bias(accel_bias_params[i][0], accel_bias_params[i][1], accel_bias_params[i][2]);
+        window_frames[i]->SetGyroBias(new_gyro_bias);
+        window_frames[i]->SetAccelBias(new_accel_bias);
     }
     
     // Update MapPoints
     for (size_t i = 0; i < mappoints.size(); ++i) {
-        if (!mappoints[i]->IsBad() && !mappoints[i]->IsMarginalized()) {
-            Eigen::Vector3f pos(point_params[i][0], point_params[i][1], point_params[i][2]);
-            mappoints[i]->SetPosition(pos);
+        if (!mappoints[i]->IsMarginalized()) {
+            Eigen::Vector3f new_pos(point_params[i][0], point_params[i][1], point_params[i][2]);
+            mappoints[i]->SetPosition(new_pos);
         }
     }
     
     result.success = summary.IsSolutionUsable();
     result.num_inliers = num_inliers;
     result.num_outliers = num_outliers;
-    result.num_poses_optimized = frames.size();
-    result.num_points_optimized = mappoints.size();
+    result.num_poses_optimized = window_frames.size() - fixed_count;
+    result.num_points_optimized = optimized_mp_count;
     result.initial_cost = summary.initial_cost;
     result.final_cost = summary.final_cost;
     result.num_iterations = summary.iterations.size();
     
     return result;
 }
+
+// BAResult Optimizer::RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
+//                             bool fix_first_pose) {
+//     BAResult result;
+
+
+//     LOG_INFO("Starting Visual-Inertial Bundle Adjustment (VIBA) with {} frames", frames.size());
+    
+//     if (frames.size() < 2) {
+//         LOG_WARN("RunVIBA: need at least 2 frames");
+//         return result;
+//     }
+    
+//     // Collect all MapPoints observed by these frames
+//     std::set<std::shared_ptr<MapPoint>> mappoint_set;
+//     for (const auto& frame : frames) {
+//         const auto& features = frame->GetFeatures();
+//         for (size_t i = 0; i < features.size(); ++i) {
+//             const auto& feature = features[i];
+//             if (!feature || !feature->IsValid()) continue;
+//             auto mp = frame->GetMapPoint(static_cast<int>(i));
+//             if (mp && !mp->IsBad()) {
+//                 mappoint_set.insert(mp);
+//             }
+//         }
+//     }
+    
+//     std::vector<std::shared_ptr<MapPoint>> mappoints(mappoint_set.begin(), mappoint_set.end());
+    
+//     if (mappoints.empty()) {
+//         LOG_WARN("RunVIBA: no valid MapPoints");
+//         return result;
+//     }
+    
+//     // ==================== Parameter blocks ====================
+//     // Pose parameters (6D perturbation, right perturbation: T_wb = T_wb_init * exp(delta_xi))
+//     std::vector<Eigen::Matrix4d> T_wb_inits(frames.size());  // Store initial poses
+//     std::vector<std::array<double, 6>> pose_params(frames.size());  // delta_xi (perturbation)
+    
+//     // Velocity parameters (3D each frame)
+//     std::vector<std::array<double, 3>> velocity_params(frames.size());
+    
+//     // Shared bias parameters (gyro and accel - same for all frames in VIBA)
+//     std::array<double, 3> gyro_bias_params;
+//     std::array<double, 3> accel_bias_params;
+    
+//     // Gravity direction (2D) and scale (1D) - fixed after IMU init
+//     std::array<double, 2> gravity_dir_params = {0.0, 0.0};
+//     std::array<double, 1> scale_params = {1.0};
+    
+//     // Point parameters
+//     std::vector<std::array<double, 3>> point_params(mappoints.size());
+    
+//     // Initialize pose, velocity, and bias parameters from each frame
+//     for (size_t i = 0; i < frames.size(); ++i) {
+//         // Pose: Right perturbation - store T_wb_init, delta_xi = 0
+//         T_wb_inits[i] = frames[i]->GetTwb().cast<double>();
+//         pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // delta_xi starts at 0
+        
+//         // Velocity
+//         Eigen::Vector3f vel = frames[i]->GetVelocity();
+//         velocity_params[i] = {vel.x(), vel.y(), vel.z()};
+        
+//         // Note: bias is shared, initialized from last frame (most recent estimate)
+//         if (i == frames.size() - 1) {
+//             Eigen::Vector3f gb = frames[i]->GetGyroBias();
+//             Eigen::Vector3f ab = frames[i]->GetAccelBias();
+//             gyro_bias_params = {gb.x(), gb.y(), gb.z()};
+//             accel_bias_params = {ab.x(), ab.y(), ab.z()};
+//         }
+//     }
+    
+//     // Gravity direction is fixed after IMU init, so just use default (0, 0)
+//     // This corresponds to gravity = [0, 0, -9.81] in world frame
+//     // The actual gravity direction was already applied during IMU initialization
+//     // gravity_dir_params stays at {0.0, 0.0}
+    
+//     // Initialize point parameters
+//     std::map<std::shared_ptr<MapPoint>, size_t> mp_to_idx;
+//     for (size_t i = 0; i < mappoints.size(); ++i) {
+//         Eigen::Vector3f pos = mappoints[i]->GetPosition();
+//         point_params[i] = {pos.x(), pos.y(), pos.z()};
+//         mp_to_idx[mappoints[i]] = i;
+//     }
+    
+//     // ==================== STAGE 1: Optimize last frame's velocity and bias ====================
+//     // Add ALL IMU factors between consecutive frames
+//     // Fix all poses, all velocities/biases except last frame's velocity and bias
+//     // Only optimize: velocity[last_idx] and gyro_bias[last_idx], accel_bias[last_idx]
+//     {
+//         ceres::Problem problem_stage1;
+        
+//         size_t last_idx = frames.size() - 1;
+//         const auto& config = ConfigUtils::GetInstance();
+        
+//         // Add ALL IMU factors between consecutive frames (right perturbation)
+//         for (size_t i = 0; i < frames.size() - 1; ++i) {
+//             auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+//             if (!preint) continue;
+            
+//             auto* imu_cost = new factor::InertialGravityScaleFactor(
+//                 preint, config.imu_gravity_magnitude);
+            
+//             problem_stage1.AddResidualBlock(
+//                 imu_cost,
+//                 nullptr,
+//                 pose_params[i].data(),
+//                 velocity_params[i].data(),
+//                 gyro_bias_params.data(),
+//                 accel_bias_params.data(),
+//                 pose_params[i + 1].data(),
+//                 velocity_params[i + 1].data(),
+//                 gravity_dir_params.data(),
+//                 scale_params.data()
+//             );
+//         }
+        
+//         // Fix ALL poses
+//         for (size_t i = 0; i < frames.size(); ++i) {
+//             problem_stage1.SetParameterBlockConstant(pose_params[i].data());
+//         }
+        
+//         // Fix ALL velocities except last frame
+//         for (size_t i = 0; i < frames.size() - 1; ++i) {
+//             problem_stage1.SetParameterBlockConstant(velocity_params[i].data());
+//         }
+//         // velocity_params[last_idx] is FREE
+        
+//         // Shared bias is FREE in Stage 1 (will be optimized)
+        
+//         // Fix gravity and scale
+//         problem_stage1.SetParameterBlockConstant(gravity_dir_params.data());
+//         problem_stage1.SetParameterBlockConstant(scale_params.data());
+        
+//         // Add bias prior to prevent drift (for shared bias)
+//         Eigen::Vector3d gyro_prior_val(gyro_bias_params[0], 
+//                                         gyro_bias_params[1], 
+//                                         gyro_bias_params[2]);
+//         Eigen::Vector3d accel_prior_val(accel_bias_params[0], 
+//                                          accel_bias_params[1], 
+//                                          accel_bias_params[2]);
+//         const double bias_prior_weight = 1e1;
+//         auto* gyro_prior = new factor::BiasPriorFactor(gyro_prior_val, bias_prior_weight);
+//         auto* accel_prior = new factor::BiasPriorFactor(accel_prior_val, bias_prior_weight);
+//         problem_stage1.AddResidualBlock(gyro_prior, nullptr, gyro_bias_params.data());
+//         problem_stage1.AddResidualBlock(accel_prior, nullptr, accel_bias_params.data());
+        
+//         ceres::Solver::Options opts1;
+//         opts1.linear_solver_type = ceres::DENSE_QR;
+//         opts1.max_num_iterations = 20;
+//         opts1.minimizer_progress_to_stdout = false;
+//         ceres::Solver::Summary summary1;
+//         ceres::Solve(opts1, &problem_stage1, &summary1);
+        
+//         LOG_INFO("VIBA Stage1: iter={}, cost {:.4f} -> {:.4f}", 
+//                  summary1.iterations.size(), summary1.initial_cost, summary1.final_cost);
+//     }
+    
+//     // Update last frame's velocity and shared bias from Stage 1
+//     size_t last_idx = frames.size() - 1;
+//     Eigen::Vector3f new_vel(velocity_params[last_idx][0], velocity_params[last_idx][1], velocity_params[last_idx][2]);
+//     frames[last_idx]->SetVelocity(new_vel);
+    
+//     // Update optimized shared bias to all frames
+//     Eigen::Vector3f optimized_gyro_bias(gyro_bias_params[0], 
+//                                          gyro_bias_params[1], 
+//                                          gyro_bias_params[2]);
+//     Eigen::Vector3f optimized_accel_bias(accel_bias_params[0], 
+//                                           accel_bias_params[1], 
+//                                           accel_bias_params[2]);
+
+//     // Update bias to all frames (shared bias)
+//     for (size_t i = 0; i < frames.size(); ++i) {
+//         frames[i]->SetGyroBias(optimized_gyro_bias);
+//         frames[i]->SetAccelBias(optimized_accel_bias);
+//     }
+
+    
+
+//     LOG_INFO("VIBA Stage1: velocity=[{:.3f},{:.3f},{:.3f}], bias bg=[{:.6f},{:.6f},{:.6f}] ba=[{:.6f},{:.6f},{:.6f}]",
+//              new_vel.x(), new_vel.y(), new_vel.z(),
+//              optimized_gyro_bias.x(), optimized_gyro_bias.y(), optimized_gyro_bias.z(),
+//              optimized_accel_bias.x(), optimized_accel_bias.y(), optimized_accel_bias.z());
+    
+//     // ==================== STAGE 2: Visual BA only ====================
+//     // Fix: first pose, all velocities, all biases, gravity, scale
+//     // Optimize: poses (except first), mappoints
+//     ceres::Problem problem;
+//     std::vector<factor::BAFactor*> ba_factors;
+//     std::vector<std::pair<size_t, size_t>> ba_factor_indices;  // (frame_idx, mp_idx)
+    
+//     // Add visual factors (BAFactor) - Right Perturbation
+//     for (size_t fi = 0; fi < frames.size(); ++fi) {
+//         const auto& frame = frames[fi];
+        
+//         double cols = static_cast<double>(frame->GetWidth());
+//         double rows = static_cast<double>(frame->GetHeight());
+//         factor::CameraParameters cam_params(cols, rows);
+        
+//         Eigen::Matrix4d T_cb = frame->GetTCB().cast<double>();
+//         Eigen::Matrix2d info = Eigen::Matrix2d::Identity() / (m_pixel_noise_std * m_pixel_noise_std);
+        
+//         const auto& features = frame->GetFeatures();
+//         for (size_t i = 0; i < features.size(); ++i) {
+//             const auto& feature = features[i];
+//             if (!feature || !feature->IsValid()) continue;
+            
+//             auto mp = frame->GetMapPoint(static_cast<int>(i));
+//             if (!mp || mp->IsBad()) continue;
+            
+//             if (IsNearBoundary(feature->GetPixelCoord())) continue;
+            
+//             auto it = mp_to_idx.find(mp);
+//             if (it == mp_to_idx.end()) continue;
+            
+//             size_t pi = it->second;
+//             Eigen::Vector2d obs(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
+            
+//             // Right perturbation: pass T_wb_init to factor
+//             auto* cost = new factor::BAFactor(obs, cam_params, T_cb, T_wb_inits[fi], info);
+//             ba_factors.push_back(cost);
+//             ba_factor_indices.push_back({fi, pi});
+            
+//             problem.AddResidualBlock(
+//                 cost,
+//                 new ceres::HuberLoss(m_huber_delta),
+//                 pose_params[fi].data(),
+//                 point_params[pi].data()
+//             );
+//         }
+//     }
+    
+//     // Add ALL IMU factors to Stage 2 (right perturbation)
+//     const auto& config = ConfigUtils::GetInstance();
+//     for (size_t i = 0; i < frames.size() - 1; ++i) {
+//         auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+//         if (!preint) continue;
+        
+//         auto* imu_cost = new factor::InertialGravityScaleFactor(
+//             preint, config.imu_gravity_magnitude);
+        
+//         problem.AddResidualBlock(
+//             imu_cost,
+//             nullptr,
+//             pose_params[i].data(),
+//             velocity_params[i].data(),
+//             gyro_bias_params.data(),
+//             accel_bias_params.data(),
+//             pose_params[i + 1].data(),
+//             velocity_params[i + 1].data(),
+//             gravity_dir_params.data(),
+//             scale_params.data()
+//         );
+//     }
+    
+//     // Stage 2: Visual-Inertial BA
+//     // Fix first pose only, optimize other poses, mappoints, velocities and biases
+//     if (fix_first_pose && !frames.empty()) {
+//         problem.SetParameterBlockConstant(pose_params[0].data());
+//     }
+    
+//     // Add velocity priors from Stage 1 (regularization, not fixed)
+//     const double velocity_prior_weight = 1000.0;
+//     for (size_t i = 0; i < frames.size(); ++i) {
+//         Eigen::Vector3d vel_prior(velocity_params[i][0], velocity_params[i][1], velocity_params[i][2]);
+//         auto* vel_prior_factor = new factor::BiasPriorFactor(vel_prior, velocity_prior_weight);
+//         problem.AddResidualBlock(vel_prior_factor, nullptr, velocity_params[i].data());
+//     }
+    
+//     // Add bias priors from Stage 1 (regularization, not fixed)
+//     const double bias_prior_weight = 100.0;
+//     Eigen::Vector3d gyro_bias_prior(gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
+//     Eigen::Vector3d accel_bias_prior(accel_bias_params[0], accel_bias_params[1], accel_bias_params[2]);
+//     auto* gyro_prior = new factor::BiasPriorFactor(gyro_bias_prior, bias_prior_weight);
+//     auto* accel_prior = new factor::BiasPriorFactor(accel_bias_prior, bias_prior_weight);
+//     problem.AddResidualBlock(gyro_prior, nullptr, gyro_bias_params.data());
+//     problem.AddResidualBlock(accel_prior, nullptr, accel_bias_params.data());
+    
+//     // Fix gravity and scale (already determined in IMU init)
+//     problem.SetParameterBlockConstant(gravity_dir_params.data());
+//     problem.SetParameterBlockConstant(scale_params.data());  // Scale is fixed
+    
+//     // ==================== Solve Stage 2 ====================
+//     // Log before Stage 2 for verification
+//     LOG_INFO("VIBA Stage2 BEFORE: vel[last]=[{:.3f},{:.3f},{:.3f}], bg=[{:.6f},{:.6f},{:.6f}], ba=[{:.6f},{:.6f},{:.6f}], scale={:.6f}",
+//              velocity_params[last_idx][0], velocity_params[last_idx][1], velocity_params[last_idx][2],
+//              gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2],
+//              accel_bias_params[0], accel_bias_params[1], accel_bias_params[2],
+//              scale_params[0]);
+    
+//     ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
+//     options.linear_solver_type = ceres::SPARSE_SCHUR;
+//     ceres::Solver::Summary summary;
+//     ceres::Solve(options, &problem, &summary);
+    
+//     // Log after Stage 2 for verification
+//     LOG_INFO("VIBA Stage2 AFTER:  vel[last]=[{:.3f},{:.3f},{:.3f}], bg=[{:.6f},{:.6f},{:.6f}], ba=[{:.6f},{:.6f},{:.6f}], scale={:.6f}",
+//              velocity_params[last_idx][0], velocity_params[last_idx][1], velocity_params[last_idx][2],
+//              gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2],
+//              accel_bias_params[0], accel_bias_params[1], accel_bias_params[2],
+//              scale_params[0]);
+    
+//     LOG_INFO("VIBA Stage2: iter={}, cost {:.4f} -> {:.4f}", 
+//              summary.iterations.size(), summary.initial_cost, summary.final_cost);
+    
+//     // ==================== Outlier detection ====================
+//     int num_inliers = 0;
+//     int num_outliers = 0;
+    
+//     std::map<std::shared_ptr<MapPoint>, int> mp_outlier_count;
+//     std::map<std::shared_ptr<MapPoint>, int> mp_inlier_count;
+    
+//     for (size_t i = 0; i < ba_factors.size(); ++i) {
+//         size_t fi = ba_factor_indices[i].first;
+//         size_t pi = ba_factor_indices[i].second;
+        
+//         const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
+//         double chi2 = ba_factors[i]->compute_chi_square(params);
+        
+//         bool is_outlier = (chi2 > 5.991);
+//         ba_factors[i]->set_outlier(is_outlier);
+        
+//         if (is_outlier) {
+//             num_outliers++;
+//             mp_outlier_count[mappoints[pi]]++;
+//         } else {
+//             num_inliers++;
+//             mp_inlier_count[mappoints[pi]]++;
+//         }
+//     }
+    
+//     // Mark bad MapPoints
+//     for (const auto& mp : mappoints) {
+//         if (mp->IsMarginalized()) continue;
+//         int inliers = mp_inlier_count[mp];
+//         int outliers = mp_outlier_count[mp];
+//         if (inliers == 0 && outliers >= 2) {
+//             mp->SetBad();
+//         }
+//     }
+    
+//     // ==================== Update results ====================
+//     // Update poses (Right Perturbation: T_wb = T_wb_init * exp(delta_xi))
+//     // Velocity and bias were already updated in Stage 1
+//     for (size_t i = 0; i < frames.size(); ++i) {
+//         Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
+//         vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+//         vio_360::SE3d T_wb_init_se3(T_wb_inits[i]);
+//         vio_360::SE3d T_wb_final = T_wb_init_se3 * delta_T;
+//         frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
+//     }
+    
+//     // Update MapPoints
+//     for (size_t i = 0; i < mappoints.size(); ++i) {
+//         if (!mappoints[i]->IsBad() && !mappoints[i]->IsMarginalized()) {
+//             Eigen::Vector3f pos(point_params[i][0], point_params[i][1], point_params[i][2]);
+//             mappoints[i]->SetPosition(pos);
+//         }
+//     }
+    
+//     result.success = summary.IsSolutionUsable();
+//     result.num_inliers = num_inliers;
+//     result.num_outliers = num_outliers;
+//     result.num_poses_optimized = frames.size();
+//     result.num_points_optimized = mappoints.size();
+//     result.initial_cost = summary.initial_cost;
+//     result.final_cost = summary.final_cost;
+//     result.num_iterations = summary.iterations.size();
+    
+//     return result;
+// }
 
 BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window_frames) {
     BAResult result;
@@ -767,15 +1250,15 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         frame_to_idx[all_frames[i]] = i;
     }
     
-    // Parameter blocks
-    std::vector<std::array<double, 6>> pose_params(all_frames.size());
-    std::vector<Eigen::Matrix4d> T_wb_inits(all_frames.size());  // Store initial poses for right perturbation
+    // Parameter blocks for right perturbation
+    std::vector<Eigen::Matrix4d> T_wb_inits(all_frames.size());  // Store initial poses
+    std::vector<std::array<double, 6>> pose_params(all_frames.size());  // delta_xi (perturbation)
     std::vector<std::array<double, 3>> point_params(mappoints.size());
     
-    // Initialize pose parameters as zero perturbation (right perturbation approach)
+    // Initialize: delta_xi = 0 (right perturbation), store T_wb_init
     for (size_t i = 0; i < all_frames.size(); ++i) {
         T_wb_inits[i] = all_frames[i]->GetTwb().cast<double>();
-        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // Zero perturbation
+        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // delta_xi starts at 0
     }
     
     // Initialize point parameters and create index map
@@ -825,7 +1308,7 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
             
             Eigen::Vector2d obs_pixel(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
             
-            // Pass initial pose for right perturbation
+            // Right perturbation: pass T_wb_init to factor
             auto* cost = new factor::BAFactor(obs_pixel, cam_params, T_cb, T_wb_inits[fi], info);
             factors.push_back(cost);
             factor_indices.push_back({fi, pi});
@@ -932,14 +1415,14 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     }
     
     // Update all optimized frame poses (frames after NUM_FIXED_KEYFRAMES)
-    // Compute final pose: T_wb = T_wb_init * exp(delta_xi) (right perturbation)
+    // Right Perturbation: T_wb = T_wb_init * exp(delta_xi)
     for (size_t i = NUM_FIXED_KEYFRAMES; i < all_frames.size(); ++i) {
         if (poses_in_problem.count(i) == 0) continue;  // Skip if not in problem
         
         Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
-        SE3d T_wb_init_se3(T_wb_inits[i]);
-        SE3d delta_T = SE3d::exp(delta_xi);
-        SE3d T_wb_final = T_wb_init_se3 * delta_T;
+        vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+        vio_360::SE3d T_wb_init_se3(T_wb_inits[i]);
+        vio_360::SE3d T_wb_final = T_wb_init_se3 * delta_T;
         all_frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
     }
     
@@ -969,6 +1452,25 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
 // IMU Initialization Optimization
 // ============================================================================
 
+double Optimizer::ComputeScaleMetric(const IMUInitResult& result, double scale) {
+    if (!result.success) {
+        return std::numeric_limits<double>::max();
+    }
+    
+    // 1. Gravity direction error: how well does gravity point down?
+    Eigen::Vector3f g_ideal(0, 0, -1.0f);  // Normalized ideal gravity
+    Eigen::Vector3f g_estimated = result.gravity.normalized();
+    double gravity_error = (g_estimated - g_ideal).norm();
+    
+    // 2. Normalize final cost by scale^2 (since residuals scale with translation)
+    double normalized_cost = result.final_cost / (scale * scale);
+    
+    // Combined metric (gravity error is more important)
+    double metric = gravity_error * 10.0 + normalized_cost;
+    
+    return metric;
+}
+
 IMUInitResult Optimizer::OptimizeIMUInit(
     const std::vector<std::shared_ptr<Frame>>& frames) {
     
@@ -989,11 +1491,23 @@ IMUInitResult Optimizer::OptimizeIMUInit(
     }
     
     LOG_INFO("========================================================");
-    LOG_INFO("[IMU_INIT] Starting 2-Stage Optimization");
+    LOG_INFO("[IMU_INIT] Starting IMU Initialization");
     LOG_INFO("  Keyframes: {}", frames.size());
-    LOG_INFO("  Mode: 360 Monocular (gravity + scale optimization)");
     LOG_INFO("========================================================");
     
+    // Use scale = 1.0 (target_median_depth applied in visual init)
+    return OptimizeIMUInitWithScale(frames, 1.0);
+}
+
+// ============================================================================
+// IMU Initialization with Specific Scale
+// ============================================================================
+
+IMUInitResult Optimizer::OptimizeIMUInitWithScale(
+    const std::vector<std::shared_ptr<Frame>>& frames,
+    double initial_scale) {
+    
+    IMUInitResult result;
     size_t num_frames = frames.size();
     
     // =========================================================================
@@ -1014,51 +1528,228 @@ IMUInitResult Optimizer::OptimizeIMUInit(
     // Gravity direction: 2D parameterization (theta_x, theta_y)
     std::vector<double> gravity_dir_params(2, 0.0);
     
-    // Scale: fixed at 1.0 for now
+    // Scale parameter
     std::vector<double> scale_params(1, 1.0);
     
-    // Initialize parameters from frames
+    // Initialize poses from frames, applying initial_scale to translations
     for (size_t i = 0; i < num_frames; ++i) {
-        // Store initial pose for right perturbation
         T_wb_inits[i] = frames[i]->GetTwb().cast<double>();
-        
-        // Pose starts at zero (identity perturbation)
+        T_wb_inits[i].block<3,1>(0,3) *= initial_scale;
         for (int j = 0; j < 6; ++j) pose_params[i][j] = 0.0;
+    }
+    
+    LOG_INFO("========================================================");
+    LOG_INFO("[IMU_INIT] 4-Stage IMU Initialization");
+    LOG_INFO("  Keyframes: {}, initial_scale: {:.4f}", num_frames, initial_scale);
+    LOG_INFO("========================================================");
+    
+    // =========================================================================
+    // STAGE 0: Gyro Bias Estimation (Rotation-only, ORB-SLAM3 style)
+    // Compare visual rotation with IMU-integrated rotation
+    // =========================================================================
+    
+    LOG_INFO("STAGE 0: Gyro Bias Estimation (Rotation-only)");
+    
+    {
+        // Solve: sum(J_Rg^T * J_Rg) * delta_bg = sum(J_Rg^T * rotation_error)
+        Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+        Eigen::Vector3d b = Eigen::Vector3d::Zero();
         
-        // Initialize velocity from preintegration (like reference code)
-        // velocity_world = R_wb_prev * delta_V
-        if (i > 0) {
-            auto preint = frames[i]->GetIMUPreintegrationFromLastKeyframe();
-            if (preint && preint->dt_total > 0.001) {
-                // Use previous frame's rotation to transform delta_V to world frame
-                Eigen::Matrix3d R_wb_prev = T_wb_inits[i-1].block<3,3>(0,0);
-                Eigen::Vector3d vel_world = R_wb_prev * preint->delta_V.cast<double>();
-                for (int j = 0; j < 3; ++j) velocity_params[i][j] = vel_world(j);
-                LOG_DEBUG("  Frame {}: velocity from preint = [{:.3f}, {:.3f}, {:.3f}]",
-                          frames[i]->GetFrameId(), vel_world(0), vel_world(1), vel_world(2));
+        int valid_pairs = 0;
+        double total_rotation_error_before = 0.0;
+        
+        for (size_t i = 0; i < num_frames - 1; ++i) {
+            auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+            if (!preint) continue;
+            
+            double dt = preint->dt_total;
+            if (dt < 0.001 || dt > 2.0) continue;
+            
+            // Visual rotation: R_ij = R_wb_i^T * R_wb_j
+            Eigen::Matrix3d R_wb_i = T_wb_inits[i].block<3,3>(0,0);
+            Eigen::Matrix3d R_wb_j = T_wb_inits[i+1].block<3,3>(0,0);
+            Eigen::Matrix3d R_ij_visual = R_wb_i.transpose() * R_wb_j;
+            
+            // IMU rotation: delta_R from preintegration
+            Eigen::Matrix3d delta_R_imu = preint->delta_R.cast<double>();
+            
+            // Rotation error: R_err = delta_R_imu^T * R_ij_visual
+            Eigen::Matrix3d R_err = delta_R_imu.transpose() * R_ij_visual;
+            
+            // Log map
+            Eigen::AngleAxisd aa(R_err);
+            Eigen::Vector3d rotation_error = aa.angle() * aa.axis();
+            
+            // Jacobian J_Rg from preintegration
+            Eigen::Matrix3d J_Rg = preint->J_Rg.cast<double>();
+            
+            // Accumulate normal equations
+            A += J_Rg.transpose() * J_Rg;
+            b += J_Rg.transpose() * rotation_error;
+            
+            total_rotation_error_before += rotation_error.norm() * 180.0 / M_PI;
+            valid_pairs++;
+        }
+        
+        if (valid_pairs > 0) {
+            // Solve for gyro bias
+            Eigen::Vector3d delta_bg = A.ldlt().solve(b);
+            gyro_bias_params[0] = delta_bg(0);
+            gyro_bias_params[1] = delta_bg(1);
+            gyro_bias_params[2] = delta_bg(2);
+            
+            double avg_err_before = total_rotation_error_before / valid_pairs;
+            
+            // Verify: recompute rotation error with estimated bias
+            double total_rotation_error_after = 0.0;
+            for (size_t i = 0; i < num_frames - 1; ++i) {
+                auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+                if (!preint || preint->dt_total < 0.001 || preint->dt_total > 2.0) continue;
+                
+                Eigen::Matrix3d R_wb_i = T_wb_inits[i].block<3,3>(0,0);
+                Eigen::Matrix3d R_wb_j = T_wb_inits[i+1].block<3,3>(0,0);
+                Eigen::Matrix3d R_ij_visual = R_wb_i.transpose() * R_wb_j;
+                
+                // Corrected IMU rotation
+                Eigen::Matrix3d delta_R_imu = preint->delta_R.cast<double>();
+                Eigen::Matrix3d J_Rg = preint->J_Rg.cast<double>();
+                Eigen::Vector3d bg_correction = J_Rg * delta_bg;
+                Eigen::Matrix3d R_correction = Eigen::Matrix3d::Identity();
+                if (bg_correction.norm() > 1e-10) {
+                    R_correction = Eigen::AngleAxisd(bg_correction.norm(), 
+                        bg_correction.normalized()).toRotationMatrix();
+                }
+                Eigen::Matrix3d delta_R_corrected = delta_R_imu * R_correction;
+                
+                Eigen::Matrix3d R_err = delta_R_corrected.transpose() * R_ij_visual;
+                Eigen::AngleAxisd aa(R_err);
+                total_rotation_error_after += aa.angle() * 180.0 / M_PI;
             }
+            double avg_err_after = total_rotation_error_after / valid_pairs;
+            
+            LOG_INFO("  Gyro bias: [{:.6f}, {:.6f}, {:.6f}] rad/s", 
+                     delta_bg(0), delta_bg(1), delta_bg(2));
+            LOG_INFO("  Rotation error: {:.3f}° -> {:.3f}° ({} pairs)", 
+                     avg_err_before, avg_err_after, valid_pairs);
+        } else {
+            LOG_WARN("  No valid pairs for gyro bias estimation");
         }
     }
     
-    // Initialize gravity direction from first frame's orientation
-    // Assume initial world frame has gravity pointing down (-Z)
-    // g_world = R_wg * [0, 0, -9.81]^T
-    // Initial guess: gravity_dir = [0, 0] means g = [0, 0, -9.81]
-    gravity_dir_params[0] = 0.0;
-    gravity_dir_params[1] = 0.0;
-    
-    LOG_INFO("[SETUP] Initial parameters:");
-    LOG_INFO("  Gravity direction: [{:.4f}, {:.4f}]", gravity_dir_params[0], gravity_dir_params[1]);
-    LOG_INFO("  Scale: {:.4f} (will be optimized)", scale_params[0]);
-    
     // =========================================================================
-    // STAGE 1: Optimize Gravity Direction + Scale
+    // STAGE 1: Initialize Velocity from Visual (ORB-SLAM3 style)
+    // v_i = (t_{i+1} - t_i) / dt
     // =========================================================================
     
-    LOG_INFO("");
-    LOG_INFO("╔══════════════════════════════════════════════════════╗");
-    LOG_INFO("║ STAGE 1: Gravity + Scale Optimization               ║");
-    LOG_INFO("╚══════════════════════════════════════════════════════╝");
+    LOG_INFO("STAGE 1: Velocity Initialization (Visual-based)");
+    
+    {
+        for (size_t i = 0; i < num_frames; ++i) {
+            if (i < num_frames - 1) {
+                auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+                if (preint && preint->dt_total > 0.001) {
+                    Eigen::Vector3d t_curr = T_wb_inits[i].block<3,1>(0,3);
+                    Eigen::Vector3d t_next = T_wb_inits[i+1].block<3,1>(0,3);
+                    double dt = preint->dt_total;
+                    Eigen::Vector3d vel = (t_next - t_curr) / dt;
+                    velocity_params[i][0] = vel(0);
+                    velocity_params[i][1] = vel(1);
+                    velocity_params[i][2] = vel(2);
+                }
+            } else {
+                // Last frame: use previous frame's velocity
+                if (num_frames > 1) {
+                    velocity_params[i][0] = velocity_params[i-1][0];
+                    velocity_params[i][1] = velocity_params[i-1][1];
+                    velocity_params[i][2] = velocity_params[i-1][2];
+                }
+            }
+        }
+        
+        LOG_INFO("  Initialized {} velocities from visual translation", num_frames);
+        LOG_DEBUG("  v[0] = [{:.3f}, {:.3f}, {:.3f}]", 
+                  velocity_params[0][0], velocity_params[0][1], velocity_params[0][2]);
+        LOG_DEBUG("  v[last] = [{:.3f}, {:.3f}, {:.3f}]", 
+                  velocity_params[num_frames-1][0], velocity_params[num_frames-1][1], velocity_params[num_frames-1][2]);
+    }
+    
+    // =========================================================================
+    // STAGE 2: Gravity Direction Estimation (ORB-SLAM3 style)
+    // dirG = -sum(R_wb_i * delta_V), then compute R_wg
+    // =========================================================================
+    
+    LOG_INFO("STAGE 2: Gravity Direction Estimation");
+    
+    {
+        Eigen::Vector3d dirG = Eigen::Vector3d::Zero();
+        int valid_count = 0;
+        
+        for (size_t i = 0; i < num_frames - 1; ++i) {
+            auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
+            if (!preint || preint->dt_total < 0.001 || preint->dt_total > 2.0) continue;
+            
+            Eigen::Matrix3d R_wb_i = T_wb_inits[i].block<3,3>(0,0);
+            
+            // Correct delta_V with estimated gyro bias
+            Eigen::Vector3d delta_V = preint->delta_V.cast<double>();
+            Eigen::Matrix3d J_Vg = preint->J_Vg.cast<double>();
+            Eigen::Vector3d bg(gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
+            delta_V = delta_V + J_Vg * bg;
+            
+            // Accumulate: dirG = -sum(R_wb_i * delta_V)
+            dirG -= R_wb_i * delta_V;
+            valid_count++;
+        }
+        
+        if (valid_count > 0 && dirG.norm() > 1e-6) {
+            dirG.normalize();
+            
+            // gI = [0, 0, -1] (unit gravity in world frame)
+            Eigen::Vector3d gI(0, 0, -1);
+            
+            // Compute rotation from gI to dirG
+            Eigen::Vector3d v = gI.cross(dirG);
+            double c = gI.dot(dirG);
+            
+            if (v.norm() > 1e-6) {
+                double angle = std::acos(std::max(-1.0, std::min(1.0, c)));
+                Eigen::Vector3d axis = v.normalized();
+                Eigen::Matrix3d R_wg = Eigen::AngleAxisd(angle, axis).toRotationMatrix();
+                
+                // Extract gravity_dir_params from R_wg
+                Eigen::AngleAxisd aa(R_wg);
+                Eigen::Vector3d omega = aa.angle() * aa.axis();
+                gravity_dir_params[0] = omega(0);
+                gravity_dir_params[1] = omega(1);
+                
+                LOG_INFO("  Gravity direction: dirG = [{:.3f}, {:.3f}, {:.3f}]",
+                         dirG(0), dirG(1), dirG(2));
+                LOG_INFO("  Gravity params: [{:.4f}, {:.4f}]", 
+                         gravity_dir_params[0], gravity_dir_params[1]);
+            } else {
+                if (c < 0) {
+                    gravity_dir_params[0] = M_PI;
+                    gravity_dir_params[1] = 0.0;
+                    LOG_INFO("  Gravity is anti-parallel (upside down)");
+                } else {
+                    gravity_dir_params[0] = 0.0;
+                    gravity_dir_params[1] = 0.0;
+                    LOG_INFO("  Gravity is already aligned");
+                }
+            }
+        } else {
+            LOG_WARN("  Could not estimate gravity direction");
+        }
+    }
+    
+    // =========================================================================
+    // STAGE 3: Joint Optimization (Gravity + Accel Bias + Scale + Velocity)
+    // Gyro bias is FIXED from Stage 0
+    // =========================================================================
+    
+    LOG_INFO("STAGE 3: Joint Optimization (Gravity + AccelBias + Scale + Velocity)");
+    LOG_INFO("  Gyro bias FIXED: [{:.6f}, {:.6f}, {:.6f}]", 
+             gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
     
     {
         ceres::Problem problem;
@@ -1070,15 +1761,10 @@ IMUInitResult Optimizer::OptimizeIMUInit(
             if (!preint) continue;
             
             double dt = preint->dt_total;
-            if (dt < 0.001 || dt > 2.0) {
-                LOG_WARN("  Invalid dt={:.4f}s between frames {} and {}", 
-                         dt, frames[i]->GetFrameId(), frames[i+1]->GetFrameId());
-                continue;
-            }
+            if (dt < 0.001 || dt > 2.0) continue;
             
-            auto* factor = new factor::InertialGravityScaleFactor(preint, 9.81);
-            
-            // Huber loss for robustness
+            auto* factor = new factor::InertialGravityScaleFactor(
+                preint, ConfigUtils::GetInstance().imu_gravity_magnitude);
             auto* loss = new ceres::HuberLoss(std::sqrt(16.0));
             
             problem.AddResidualBlock(factor, loss,
@@ -1095,123 +1781,56 @@ IMUInitResult Optimizer::OptimizeIMUInit(
         }
         
         if (factors_added == 0) {
-            LOG_WARN("[IMU_INIT] No valid factors added");
+            LOG_WARN("[IMU_INIT] No valid factors added in Stage 3");
             return result;
         }
         
-        LOG_INFO("  Added {} InertialGravityScaleFactor(s)", factors_added);
+        // Add weak accel bias prior (regularization toward zero)
+        Eigen::Vector3d zero_bias = Eigen::Vector3d::Zero();
+        double accel_bias_weight = 0.1;
+        auto* accel_prior = new factor::BiasPriorFactor(zero_bias, accel_bias_weight);
+        problem.AddResidualBlock(accel_prior, nullptr, accel_bias_params.data());
         
-        // Fix poses, velocities, biases in Stage 1
-        // Only gravity_dir and scale are FREE (for monocular)
+        // FIXED: All poses, Gyro bias
         for (size_t i = 0; i < num_frames; ++i) {
             problem.SetParameterBlockConstant(pose_params[i].data());
-            problem.SetParameterBlockConstant(velocity_params[i].data());
         }
-        problem.SetParameterBlockConstant(gyro_bias_params.data());
-        problem.SetParameterBlockConstant(accel_bias_params.data());
+        problem.SetParameterBlockConstant(gyro_bias_params.data());  // Fixed from Stage 0
         
-        // Scale is FREE (always optimize for 360 monocular)
-        // gravity_dir and scale are both FREE
+        // FREE: Gravity direction, Accel bias, Scale, Velocities
+        // Scale must be positive (lower bound > 0)
+        problem.SetParameterLowerBound(scale_params.data(), 0, 0.001);  // Scale > 0.001
         
         // Solve
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::DENSE_QR;
-        options.max_num_iterations = 50;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        options.max_num_iterations = 200;
         options.minimizer_progress_to_stdout = false;
         
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         
         result.initial_cost = summary.initial_cost;
-        
-        LOG_INFO("  Stage 1 result:");
-        LOG_INFO("    Iterations: {}", summary.iterations.size());
-        LOG_INFO("    Cost: {:.6f} -> {:.6f}", summary.initial_cost, summary.final_cost);
-        LOG_INFO("    Gravity dir: [{:.4f}, {:.4f}]", gravity_dir_params[0], gravity_dir_params[1]);
-        LOG_INFO("    Scale: {:.4f} (optimized)", scale_params[0]);
-    }
-    
-    // =========================================================================
-    // STAGE 2: Optimize Velocities and Biases (gravity and scale fixed)
-    // =========================================================================
-    
-    LOG_INFO("");
-    LOG_INFO("╔══════════════════════════════════════════════════════╗");
-    LOG_INFO("║ STAGE 2: Velocity + Bias Optimization                ║");
-    LOG_INFO("╚══════════════════════════════════════════════════════╝");
-    
-    {
-        ceres::Problem problem;
-        
-        // Add InertialGravityScaleFactor between consecutive frames
-        int factors_added = 0;
-        for (size_t i = 0; i < num_frames - 1; ++i) {
-            auto preint = frames[i + 1]->GetIMUPreintegrationFromLastKeyframe();
-            if (!preint) continue;
-            
-            double dt = preint->dt_total;
-            if (dt < 0.001 || dt > 2.0) continue;
-            
-            auto* factor = new factor::InertialGravityScaleFactor(preint, 9.81);
-            auto* loss = new ceres::HuberLoss(std::sqrt(16.0));
-            
-            problem.AddResidualBlock(factor, loss,
-                pose_params[i].data(),
-                velocity_params[i].data(),
-                gyro_bias_params.data(),
-                accel_bias_params.data(),
-                pose_params[i + 1].data(),
-                velocity_params[i + 1].data(),
-                gravity_dir_params.data(),
-                scale_params.data());
-            
-            factors_added++;
-        }
-        
-        // Add bias prior (regularization)
-        Eigen::Vector3d zero_bias = Eigen::Vector3d::Zero();
-        double bias_weight = 1.0;  // Weak prior
-        
-        auto* gyro_prior = new factor::BiasPriorFactor(zero_bias, bias_weight);
-        auto* accel_prior = new factor::BiasPriorFactor(zero_bias, bias_weight);
-        
-        problem.AddResidualBlock(gyro_prior, nullptr, gyro_bias_params.data());
-        problem.AddResidualBlock(accel_prior, nullptr, accel_bias_params.data());
-        
-        // Fix poses, gravity_dir, and scale in Stage 2
-        for (size_t i = 0; i < num_frames; ++i) {
-            problem.SetParameterBlockConstant(pose_params[i].data());
-        }
-        problem.SetParameterBlockConstant(gravity_dir_params.data());
-        problem.SetParameterBlockConstant(scale_params.data());
-        
-        // Velocities and biases are FREE
-        
-        // Solve
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::DENSE_QR;
-        options.max_num_iterations = 50;
-        options.minimizer_progress_to_stdout = false;
-        
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
-        
         result.final_cost = summary.final_cost;
         
-        LOG_INFO("  Stage 2 result:");
-        LOG_INFO("    Iterations: {}", summary.iterations.size());
-        LOG_INFO("    Cost: {:.6f} -> {:.6f}", summary.initial_cost, summary.final_cost);
-        LOG_INFO("    Gyro bias: [{:.6f}, {:.6f}, {:.6f}]", 
-                 gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
+        LOG_INFO("  Stage 3 result:");
+        LOG_INFO("    Scale: {:.4f}", scale_params[0]);
+        LOG_INFO("    Gravity params: [{:.4f}, {:.4f}]", gravity_dir_params[0], gravity_dir_params[1]);
         LOG_INFO("    Accel bias: [{:.6f}, {:.6f}, {:.6f}]", 
                  accel_bias_params[0], accel_bias_params[1], accel_bias_params[2]);
+        LOG_INFO("    Cost: {:.6f} -> {:.6f}", summary.initial_cost, summary.final_cost);
     }
     
     // =========================================================================
     // Extract results
     // =========================================================================
     
+    double final_scale = initial_scale * scale_params[0];
+    
     // Compute gravity vector from direction
+    const auto& config = ConfigUtils::GetInstance();
+    double gravity_mag = config.imu_gravity_magnitude;
     double theta_x = gravity_dir_params[0];
     double theta_y = gravity_dir_params[1];
     Eigen::Vector3d omega(theta_x, theta_y, 0.0);
@@ -1223,34 +1842,50 @@ IMUInitResult Optimizer::OptimizeIMUInit(
         Eigen::Vector3d axis = omega / angle;
         R_wg = Eigen::AngleAxisd(angle, axis).toRotationMatrix();
     }
-    Eigen::Vector3d g_I(0, 0, -9.81);
+    Eigen::Vector3d g_I(0, 0, -gravity_mag);
     Eigen::Vector3d gravity = R_wg * g_I;
     
+    // Apply final scale to poses
+    Eigen::Vector3d t0 = T_wb_inits[0].block<3,1>(0,3);
+    for (size_t i = 1; i < num_frames; ++i) {
+        Eigen::Vector3d t_i = T_wb_inits[i].block<3,1>(0,3);
+        Eigen::Vector3d t_i_new = t0 + scale_params[0] * (t_i - t0);
+        T_wb_inits[i].block<3,1>(0,3) = t_i_new;
+    }
+    
+    // Store results
     result.success = true;
     result.gravity = gravity.cast<float>();
-    result.Rwg = R_wg.cast<float>();  // Store Rwg for coordinate transformation
-    result.scale = scale_params[0];
+    result.Rwg = R_wg.cast<float>();
+    result.scale = final_scale;
     result.gyro_bias = Eigen::Vector3f(gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
     result.accel_bias = Eigen::Vector3f(accel_bias_params[0], accel_bias_params[1], accel_bias_params[2]);
     
-    // Store velocities
-    result.velocities.resize(num_frames);
+    // Store scaled poses
+    result.scaled_poses.resize(num_frames);
     for (size_t i = 0; i < num_frames; ++i) {
-        result.velocities[i] = Eigen::Vector3f(
-            velocity_params[i][0], velocity_params[i][1], velocity_params[i][2]);
+        result.scaled_poses[i] = T_wb_inits[i].cast<float>();
     }
     
-    LOG_INFO("");
+    // Store scaled velocities
+    result.velocities.resize(num_frames);
+    for (size_t i = 0; i < num_frames; ++i) {
+        // Apply scale to velocities
+        result.velocities[i] = Eigen::Vector3f(
+            velocity_params[i][0] * scale_params[0],
+            velocity_params[i][1] * scale_params[0],
+            velocity_params[i][2] * scale_params[0]);
+    }
+    
     LOG_INFO("========================================================");
-    LOG_INFO("[IMU_INIT] Optimization Complete!");
-    LOG_INFO("  Gravity: [{:.4f}, {:.4f}, {:.4f}] (magnitude: {:.4f})",
-             result.gravity.x(), result.gravity.y(), result.gravity.z(),
-             result.gravity.norm());
-    LOG_INFO("  Scale: {:.4f}", result.scale);
+    LOG_INFO("[IMU_INIT] Initialization Complete");
+    LOG_INFO("  Final scale: {:.4f}", final_scale);
+    LOG_INFO("  Gravity: [{:.3f}, {:.3f}, {:.3f}] (norm={:.3f})",
+             gravity(0), gravity(1), gravity(2), gravity.norm());
     LOG_INFO("  Gyro bias: [{:.6f}, {:.6f}, {:.6f}]",
-             result.gyro_bias.x(), result.gyro_bias.y(), result.gyro_bias.z());
+             gyro_bias_params[0], gyro_bias_params[1], gyro_bias_params[2]);
     LOG_INFO("  Accel bias: [{:.6f}, {:.6f}, {:.6f}]",
-             result.accel_bias.x(), result.accel_bias.y(), result.accel_bias.z());
+             accel_bias_params[0], accel_bias_params[1], accel_bias_params[2]);
     LOG_INFO("========================================================");
     
     return result;

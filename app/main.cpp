@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
     auto estimator = std::make_unique<vio_360::Estimator>();
     auto viz = std::make_unique<vio_360::VizUtils>(1920, 1080);
     viz->Initialize();
+    viz->SetDataDirectory(dataset_dir);
     
     LOG_INFO("Starting VIO...");
     

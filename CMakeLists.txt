@@ -34,6 +34,8 @@ set(BUILD_EXAMPLES OFF CACHE BOOL "Build Ceres examples" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "Build Ceres benchmarks" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "Build Ceres tests" FORCE)
 set(PROVIDE_UNINSTALL_TARGET OFF CACHE BOOL "Disable Ceres uninstall target" FORCE)
+set(SUITESPARSE OFF CACHE BOOL "Disable SuiteSparse to avoid version conflicts" FORCE)
+set(CXSPARSE OFF CACHE BOOL "Disable CXSparse" FORCE)
 add_subdirectory(thirdparty/ceres-solver EXCLUDE_FROM_ALL)
 
 # spdlog (header-only)

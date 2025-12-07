@@ -162,10 +162,12 @@ bool Initializer::TryMonocularInitialization(
     
     LOG_INFO("  [MonoInit] Validation passed, mean_reproj={:.2f}px", mean_reproj_error);
     
-    // 8. Normalize scale so median depth = 10.0 (reasonable indoor/outdoor scale)
-    float scale_factor = NormalizeScale(points3d, t);
+    // 8. Normalize scale so median depth = 1.0 (unit scale for IMU initialization)
+    // This scales both points3d and translation vector t
+    float scale_factor = 1.0f;//NormalizeScale(points3d, t);
+    LOG_INFO("  [MonoInit] Scale normalization: factor={:.4f}", scale_factor);
     
-    // 9. Set frame poses
+    // 9. Set frame poses (using scaled translation t)
     // Essential matrix gives us camera-to-camera transformation T_c1c2
     // T_c1c2 = [R | t]: transforms points from camera1 frame to camera2 frame
     // We need to convert camera poses to body poses using T_BC (camera-to-body)
@@ -173,13 +175,6 @@ bool Initializer::TryMonocularInitialization(
     // Get extrinsic transformation
     Eigen::Matrix4f T_BC = frame1->GetTBC();  // camera-to-body (c → b)
     Eigen::Matrix4f T_CB = T_BC.inverse();    // body-to-camera (b → c)
-    
-    // Debug: Print T_BC to verify it's loaded correctly
-    LOG_INFO("T_BC (camera→body):");
-    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(0,0), T_BC(0,1), T_BC(0,2), T_BC(0,3));
-    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(1,0), T_BC(1,1), T_BC(1,2), T_BC(1,3));
-    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(2,0), T_BC(2,1), T_BC(2,2), T_BC(2,3));
-    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(3,0), T_BC(3,1), T_BC(3,2), T_BC(3,3));
     
     // World frame = Body1 frame (body1 is at world origin)
     // T_wb1 = Identity
@@ -191,11 +186,12 @@ bool Initializer::TryMonocularInitialization(
     Eigen::Matrix4f T_wc1 = T_wb1 * T_BC;
     
     // T_c1c2 = [R | t]: transforms points from camera1 to camera2 frame
+    // Note: t is already scaled by NormalizeScale above
     // T_c2c1 = T_c1c2^(-1): transforms points from camera2 to camera1 frame
     // Camera2 pose in world: T_wc2 = T_wc1 * T_c2c1
     Eigen::Matrix4f T_c1c2 = Eigen::Matrix4f::Identity();
     T_c1c2.block<3, 3>(0, 0) = R;
-    T_c1c2.block<3, 1>(0, 3) = t;
+    T_c1c2.block<3, 1>(0, 3) = t;  // scaled translation
     Eigen::Matrix4f T_c2c1 = T_c1c2.inverse();
     Eigen::Matrix4f T_wc2 = T_wc1 * T_c2c1;
     
@@ -204,18 +200,20 @@ bool Initializer::TryMonocularInitialization(
     frame2->SetTwb(T_wb2);
     frame2->SetKeyframe(true);
     
-    // Debug: verify camera centers
+    // Debug: verify camera centers (should reflect scaled baseline)
+    float baseline = 0.0f;
     {
         Eigen::Matrix4f T_wc1_check = frame1->GetTwc();
         Eigen::Matrix4f T_wc2_check = frame2->GetTwc();
         Eigen::Vector3f C1 = T_wc1_check.block<3, 1>(0, 3);
         Eigen::Vector3f C2 = T_wc2_check.block<3, 1>(0, 3);
+        baseline = (C1 - C2).norm();
         LOG_INFO("Init poses: C1=({:.4f},{:.4f},{:.4f}), C2=({:.4f},{:.4f},{:.4f}), baseline={:.4f}",
-                 C1.x(), C1.y(), C1.z(), C2.x(), C2.y(), C2.z(), (C1-C2).norm());
+                 C1.x(), C1.y(), C1.z(), C2.x(), C2.y(), C2.z(), baseline);
     }
     
     // 10. Transform points from camera1 frame to world (=body1) frame
-    // points3d are in camera1 coordinates, need to transform to world
+    // points3d are in camera1 coordinates (already scaled), need to transform to world
     // p_world = T_wc1 * p_c1 = T_BC * p_c1 (since T_wb1 = I)
     Eigen::Matrix3f R_wc1 = T_wc1.block<3, 3>(0, 0);
     Eigen::Vector3f t_wc1 = T_wc1.block<3, 1>(0, 3);
@@ -236,7 +234,6 @@ bool Initializer::TryMonocularInitialization(
     result.points3d = points3d;
     result.frame1_id = frame1->GetFrameId();
     result.frame2_id = frame2->GetFrameId();
-    result.scale_factor = scale_factor;
     result.initialized_keyframes.push_back(frame1);
     result.initialized_keyframes.push_back(frame2);
     
@@ -1033,7 +1030,7 @@ float Initializer::NormalizeScale(
     }
     
     // Scale factor to normalize median depth to 1.0 (unit scale for IMU initialization)
-    const float target_median_depth = 1.0f;
+    const float target_median_depth = 100.0f;
     float scale_factor = target_median_depth / median_depth;
     
     // Scale all 3D points

@@ -395,6 +395,52 @@ private:
     double weight_;
 };
 
+/**
+ * @brief Bias consistency factor between consecutive frames
+ * 
+ * Enforces that bias doesn't change too much between frames:
+ * cost = 0.5 * weight * ||bias_j - bias_i||^2
+ */
+class BiasConsistencyFactor : public ceres::SizedCostFunction<3, 3, 3> {
+public:
+    BiasConsistencyFactor(double weight) : weight_(weight) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                         double* residuals,
+                         double** jacobians) const override {
+        const double* bias_i = parameters[0];
+        const double* bias_j = parameters[1];
+        
+        // Residual: r = weight * (bias_j - bias_i)
+        for (int i = 0; i < 3; ++i) {
+            residuals[i] = weight_ * (bias_j[i] - bias_i[i]);
+        }
+        
+        // Jacobian w.r.t bias_i: dr/dbias_i = -weight * I
+        if (jacobians != nullptr && jacobians[0] != nullptr) {
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    jacobians[0][i * 3 + j] = (i == j) ? -weight_ : 0.0;
+                }
+            }
+        }
+        
+        // Jacobian w.r.t bias_j: dr/dbias_j = weight * I
+        if (jacobians != nullptr && jacobians[1] != nullptr) {
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    jacobians[1][i * 3 + j] = (i == j) ? weight_ : 0.0;
+                }
+            }
+        }
+        
+        return true;
+    }
+
+private:
+    double weight_;
+};
+
 
 /**
  * @brief Generic vector prior factor template
@@ -481,12 +527,14 @@ private:
  * @brief Inertial factor with fixed gravity for Visual-Inertial BA
  * 
  * Used after IMU initialization when gravity direction is known and fixed.
- * Optimizes poses and velocities while keeping gravity constant.
+ * Optimizes poses, velocities and individual biases per frame.
+ * Uses frame_i's bias for preintegration correction.
  * 
  * Residual: [rotation_error(3), velocity_error(3), position_error(3)] = 9D
- * Parameters: pose_i[6], velocity_i[3], gyro_bias[3], accel_bias[3], pose_j[6], velocity_j[3]
+ * Parameters: pose_i[6], velocity_i[3], gyro_bias_i[3], accel_bias_i[3], 
+ *             pose_j[6], velocity_j[3], gyro_bias_j[3], accel_bias_j[3]
  */
-class InertialFactorFixedGravity : public ceres::SizedCostFunction<9, 6, 3, 3, 3, 6, 3> {
+class InertialFactorFixedGravity : public ceres::SizedCostFunction<9, 6, 3, 3, 3, 6, 3, 3, 3> {
 public:
     /**
      * @brief Constructor

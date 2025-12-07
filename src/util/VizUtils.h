@@ -91,6 +91,21 @@ public:
     }
     
     /**
+     * @brief Check if save was requested
+     */
+    bool IsSaveRequested() const { return m_save_requested; }
+    
+    /**
+     * @brief Set data directory for saving trajectory
+     */
+    void SetDataDirectory(const std::string& dir) { m_data_directory = dir; }
+    
+    /**
+     * @brief Save trajectory to file in TUM format
+     */
+    void SaveTrajectory(const Estimator* estimator);
+    
+    /**
      * @brief Get color from age
      */
     static cv::Scalar GetColorFromAge(int age, int max_age = 10);
@@ -135,10 +150,13 @@ private:
     std::unique_ptr<pangolin::Var<int>> m_point_size;
     std::unique_ptr<pangolin::Var<bool>> m_pause_button;
     std::unique_ptr<pangolin::Var<bool>> m_step_button;
+    std::unique_ptr<pangolin::Var<bool>> m_finish_save_button;
     
     // Pause state
     bool m_paused;
     bool m_step_requested;
+    bool m_save_requested;
+    std::string m_data_directory;
     
     // Currently tracked MapPoints and their colors (for matching colors between 2D and 3D views)
     std::vector<std::shared_ptr<MapPoint>> m_current_tracked_mappoints;

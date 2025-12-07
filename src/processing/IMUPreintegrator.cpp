@@ -12,6 +12,7 @@
 
 #include "processing/IMUPreintegrator.h"
 #include "processing/Estimator.h"
+#include "util/LieUtils.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -208,33 +209,49 @@ void IMUPreintegrator::IntegrateMeasurement(
     gyro -= preint->gyro_bias;
     accel -= preint->accel_bias;
     
-    // Current state
-    Eigen::Matrix3f R = preint->delta_R;
-    Eigen::Vector3f V = preint->delta_V;
-    Eigen::Vector3f P = preint->delta_P;
+    // Current state (before update)
+    Eigen::Matrix3f dR = preint->delta_R;
+    Eigen::Vector3f dV = preint->delta_V;
+    Eigen::Vector3f dP = preint->delta_P;
     
-    // Update rotation using Rodrigues formula
+    // Skew-symmetric matrix of acceleration (for Jacobian computation)
+    Eigen::Matrix3f Wacc = SkewSymmetric(accel);
+    
+    // =========================================================================
+    // ORB-SLAM3 style: Update P, V FIRST (before rotation update)
+    // =========================================================================
+    
+    // Update position (uses old dV and dR)
+    preint->delta_P = dP + dV * dt + 0.5f * dR * accel * dt * dt;
+    
+    // Update velocity (uses old dR)
+    preint->delta_V = dV + dR * accel * dt;
+    
+    // =========================================================================
+    // Update Jacobians w.r.t. biases (ORB-SLAM3 style, before rotation update)
+    // =========================================================================
+    
+    // Position Jacobians (must be updated before velocity Jacobians change)
+    preint->J_Pa = preint->J_Pa + preint->J_Va * dt - 0.5f * dR * dt * dt;
+    preint->J_Pg = preint->J_Pg + preint->J_Vg * dt - 0.5f * dR * dt * dt * Wacc * preint->J_Rg;
+    
+    // Velocity Jacobians
+    preint->J_Va = preint->J_Va - dR * dt;
+    preint->J_Vg = preint->J_Vg - dR * dt * Wacc * preint->J_Rg;
+    
+    // =========================================================================
+    // Update rotation LAST (ORB-SLAM3 style)
+    // =========================================================================
+    
     Eigen::Vector3f omega_dt = gyro * dt;
-    Eigen::Matrix3f dR = Rodrigues(omega_dt);
+    Eigen::Matrix3f deltaR = Rodrigues(omega_dt);
     Eigen::Matrix3f Jr = RightJacobian(omega_dt);
     
-    // Update Jacobians w.r.t gyro bias
-    preint->J_Rg = -dR.transpose() * Jr * dt;
-    preint->J_Vg = preint->J_Vg + preint->J_Va * SkewSymmetric(accel) * preint->J_Rg;
-    preint->J_Pg = preint->J_Pg + preint->J_Pa * SkewSymmetric(accel) * preint->J_Rg + preint->J_Vg * dt;
+    // Update delta rotation (use SO3 for proper normalization)
+    preint->delta_R = SO3(dR * deltaR).Matrix();
     
-    // Update rotation
-    preint->delta_R = R * dR;
-    
-    // Update velocity
-    Eigen::Vector3f dV = R * accel * dt;
-    preint->delta_V = V + dV;
-    preint->J_Va = preint->J_Va + R * dt;  // Jacobian w.r.t accel bias
-    
-    // Update position
-    Eigen::Vector3f dP = V * dt + 0.5f * R * accel * dt * dt;
-    preint->delta_P = P + dP;
-    preint->J_Pa = preint->J_Pa + preint->J_Va * dt + 0.5f * R * dt * dt;  // Jacobian w.r.t accel bias
+    // Update rotation Jacobian (after rotation update)
+    preint->J_Rg = deltaR.transpose() * preint->J_Rg - Jr * dt;
 }
 
 void IMUPreintegrator::UpdateCovariance(
@@ -337,20 +354,22 @@ Eigen::Matrix3f IMUPreintegrator::Rodrigues(const Eigen::Vector3f& omega) const 
 }
 
 Eigen::Matrix3f IMUPreintegrator::RightJacobian(const Eigen::Vector3f& omega) const {
-    float theta = omega.norm();
+    float theta_sq = omega.squaredNorm();
+    float theta = std::sqrt(theta_sq);
     
     if (theta < 1e-6f) {
-        // Small angle approximation
+        // Small angle approximation: Jr ≈ I - 0.5 * [omega]_×
         return Eigen::Matrix3f::Identity() - 0.5f * SkewSymmetric(omega);
     }
     
-    Eigen::Vector3f axis = omega / theta;
-    Eigen::Matrix3f K = SkewSymmetric(axis);
+    // ORB-SLAM3/Sophus style: use W = hat(omega) directly (not unit axis)
+    Eigen::Matrix3f W = SkewSymmetric(omega);
     
-    // Right Jacobian: Jr = I - ((1-cos(θ))/θ)K + ((θ-sin(θ))/θ)K²
+    // Right Jacobian: Jr = I - (1-cos(θ))/θ² * W + (θ-sin(θ))/θ³ * W²
+    float theta_cu = theta_sq * theta;
     return Eigen::Matrix3f::Identity() 
-         - ((1.0f - std::cos(theta)) / theta) * K 
-         + ((theta - std::sin(theta)) / theta) * K * K;
+         - ((1.0f - std::cos(theta)) / theta_sq) * W 
+         + ((theta - std::sin(theta)) / theta_cu) * W * W;
 }
 
 } // namespace vio_360

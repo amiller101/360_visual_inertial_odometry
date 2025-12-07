@@ -1327,7 +1327,7 @@ bool InertialFactorFixedGravity::Evaluate(double const* const* parameters,
                                           double* residuals,
                                           double** jacobians) const {
     // ===============================================================================
-    // Extract parameters (right perturbation approach)
+    // Extract parameters (right perturbation approach) - Individual bias per frame
     // ===============================================================================
     
     // parameters[0]: delta_xi_i [6] - perturbation for pose i
@@ -1341,11 +1341,11 @@ bool InertialFactorFixedGravity::Evaluate(double const* const* parameters,
     // parameters[1]: velocity_i [3]
     Eigen::Map<const Eigen::Vector3d> vi(parameters[1]);
     
-    // parameters[2]: shared gyro bias [3]
-    Eigen::Map<const Eigen::Vector3d> bg(parameters[2]);
+    // parameters[2]: gyro bias for frame i [3]
+    Eigen::Map<const Eigen::Vector3d> bg_i(parameters[2]);
     
-    // parameters[3]: shared accel bias [3]
-    Eigen::Map<const Eigen::Vector3d> ba(parameters[3]);
+    // parameters[3]: accel bias for frame i [3]
+    Eigen::Map<const Eigen::Vector3d> ba_i(parameters[3]);
     
     // parameters[4]: delta_xi_j [6] - perturbation for pose j
     Eigen::Map<const Eigen::Vector6d> delta_xi_j(parameters[4]);
@@ -1357,6 +1357,12 @@ bool InertialFactorFixedGravity::Evaluate(double const* const* parameters,
     // parameters[5]: velocity_j [3]
     Eigen::Map<const Eigen::Vector3d> vj(parameters[5]);
     
+    // parameters[6]: gyro bias for frame j [3] (for optimization, not used in residual)
+    Eigen::Map<const Eigen::Vector3d> bg_j(parameters[6]);
+    
+    // parameters[7]: accel bias for frame j [3] (for optimization, not used in residual)
+    Eigen::Map<const Eigen::Vector3d> ba_j(parameters[7]);
+    
     // ===============================================================================
     // Get bias-corrected preintegration values
     // ===============================================================================
@@ -1367,9 +1373,9 @@ bool InertialFactorFixedGravity::Evaluate(double const* const* parameters,
     Eigen::Vector3d delta_V = m_preintegration->delta_V.cast<double>();
     Eigen::Vector3d delta_P = m_preintegration->delta_P.cast<double>();
     
-    // Apply bias corrections
-    Eigen::Vector3d delta_bg = bg - m_preintegration->gyro_bias.cast<double>();
-    Eigen::Vector3d delta_ba = ba - m_preintegration->accel_bias.cast<double>();
+    // Apply bias corrections using frame_i's bias (preintegration starts from frame i)
+    Eigen::Vector3d delta_bg = bg_i - m_preintegration->gyro_bias.cast<double>();
+    Eigen::Vector3d delta_ba = ba_i - m_preintegration->accel_bias.cast<double>();
     
     if (delta_bg.norm() > 1e-6 || delta_ba.norm() > 1e-6) {
         Eigen::Matrix3d J_Rg = m_preintegration->J_Rg.cast<double>();
@@ -1478,6 +1484,16 @@ bool InertialFactorFixedGravity::Evaluate(double const* const* parameters,
             J.setZero();
             // d(ev)/d(vj) = R_bwi
             J.block<3, 3>(3, 0) = m_sqrt_information.block<3, 3>(3, 3) * R_bwi;
+        }
+        if (jacobians[6] != nullptr) {
+            // Jacobian w.r.t gyro bias j (not used in residual, zero gradient)
+            Eigen::Map<Eigen::Matrix<double, 9, 3, Eigen::RowMajor>> J(jacobians[6]);
+            J.setZero();
+        }
+        if (jacobians[7] != nullptr) {
+            // Jacobian w.r.t accel bias j (not used in residual, zero gradient)
+            Eigen::Map<Eigen::Matrix<double, 9, 3, Eigen::RowMajor>> J(jacobians[7]);
+            J.setZero();
         }
     }
     

@@ -14,6 +14,7 @@
 
 #include <memory>
 #include <vector>
+#include <unordered_map>
 #include <opencv2/opencv.hpp>
 #include <Eigen/Dense>
 
@@ -33,6 +34,19 @@ struct IMUData {
     double timestamp;    // seconds
     float ax, ay, az;    // m/s^2
     float gx, gy, gz;    // rad/s
+};
+
+/**
+ * @brief Tracking state enumeration (ORB-SLAM3 style)
+ * 
+ * State transitions:
+ *   NOT_INITIALIZED -> VISUAL_ONLY: After successful 2-frame VO initialization
+ *   VISUAL_ONLY -> VIO: After successful IMU initialization (10 KF, 2s)
+ */
+enum class TrackingState {
+    NOT_INITIALIZED,  // Before VO initialization
+    VISUAL_ONLY,      // After VO init, before IMU init (PnP tracking only)
+    VIO               // Full Visual-Inertial Odometry
 };
 
 /**
@@ -123,13 +137,25 @@ public:
      * @brief Check if system is initialized
      * @return True if initialized
      */
-    bool IsInitialized() const { return m_initialized; }
+    bool IsInitialized() const { return m_tracking_state != TrackingState::NOT_INITIALIZED; }
     
     /**
      * @brief Check if IMU is initialized
      * @return True if IMU initialized
      */
-    bool IsIMUInitialized() const { return m_imu_initialized; }
+    bool IsIMUInitialized() const { return m_tracking_state == TrackingState::VIO; }
+    
+    /**
+     * @brief Get frame index when IMU was initialized
+     * @return Frame index (-1 if not initialized)
+     */
+    int GetIMUInitFrameIndex() const { return m_imu_init_frame_idx; }
+    
+    /**
+     * @brief Get current tracking state
+     * @return Current tracking state
+     */
+    TrackingState GetTrackingState() const { return m_tracking_state; }
     
     /**
      * @brief Get estimated gravity direction
@@ -216,15 +242,19 @@ private:
     int m_frame_id_counter;
     
     // Initialization state
-    bool m_initialized;
-    bool m_imu_initialized;
+    TrackingState m_tracking_state;  // Current tracking state (NOT_INITIALIZED -> VISUAL_ONLY -> VIO)
     float m_min_parallax;
+    
+    // ORB-SLAM3 style IMU initialization tracking
+    double m_first_keyframe_time;    // Timestamp of first keyframe (for 2s requirement)
+    double m_last_keyframe_time;     // Timestamp of last keyframe (for 0.25s interval)
     
     // IMU states
     Eigen::Vector3f m_gravity;      // Gravity in world frame
     Eigen::Vector3f m_gyro_bias;    // Gyro bias [rad/s]
     Eigen::Vector3f m_accel_bias;   // Accel bias [m/s^2]
     double m_scale;                 // Visual-inertial scale
+    int m_imu_init_frame_idx;       // Frame index when IMU was initialized (-1 if not initialized)
     
     // Initialized map points and poses
     std::vector<Eigen::Vector3f> m_initialized_points;  // 3D points from initialization
@@ -286,6 +316,14 @@ private:
      * @return True if IMU initialization successful
      */
     bool TryInitializeIMU();
+    
+    /**
+     * @brief Initialize IMU using interpolation-based approach
+     * Uses intermediate frames between first two keyframes with interpolated poses
+     * and frame-to-frame IMU preintegration for more accurate initial estimates.
+     * @return True if IMU initialization successful
+     */
+    bool TryInitializeIMUWithInterpolation();
     
     /**
      * @brief Update all preintegrations in keyframes with new bias values
@@ -356,6 +394,12 @@ private:
      * @brief Accumulate IMU data since last keyframe
      */
     std::vector<IMUData> m_imu_since_last_keyframe;
+    
+    /**
+     * @brief Store IMU data segments for interpolation-based init
+     * Maps frame ID to IMU data from previous frame to this frame
+     */
+    std::unordered_map<int, std::vector<IMUData>> m_imu_data_per_frame;
 };
 
 } // namespace vio_360

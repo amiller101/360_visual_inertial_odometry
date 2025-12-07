@@ -16,6 +16,8 @@
 #include "Feature.h"
 #include "MapPoint.h"
 #include <iostream>
+#include <fstream>
+#include <iomanip>
 #include <GL/glu.h>
 #include <set>
 
@@ -25,7 +27,8 @@ VizUtils::VizUtils(int window_width, int window_height)
     : m_window_width(window_width)
     , m_window_height(window_height)
     , m_paused(false)
-    , m_step_requested(false) {
+    , m_step_requested(false)
+    , m_save_requested(false) {
 }
 
 VizUtils::~VizUtils() {
@@ -86,6 +89,7 @@ void VizUtils::Initialize() {
     m_point_size = std::make_unique<pangolin::Var<int>>("ui.Point Size", 2, 1, 10);
     m_pause_button = std::make_unique<pangolin::Var<bool>>("ui.Pause", false, false);
     m_step_button = std::make_unique<pangolin::Var<bool>>("ui.Step", false, false);
+    m_finish_save_button = std::make_unique<pangolin::Var<bool>>("ui.Finish & Save", false, false);
 }
 
 void VizUtils::Update(const Estimator* estimator, 
@@ -103,6 +107,12 @@ void VizUtils::Update(const Estimator* estimator,
         if (m_paused) {
             m_step_requested = true;
         }
+    }
+    
+    // Check Finish & Save button
+    if (pangolin::Pushed(*m_finish_save_button)) {
+        SaveTrajectory(estimator);
+        pangolin::Quit();  // Signal to close the application
     }
     
     // Clear screen with black background
@@ -193,10 +203,10 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
         }
     }
     
-    // Draw trajectory
-    if (*m_show_trajectory) {
-        const auto& frames = estimator->GetAllFrames();
-        DrawTrajectory(frames);
+    // Draw trajectory (only window keyframes)
+    if (*m_show_trajectory && estimator->IsInitialized()) {
+        const auto& keyframes = estimator->GetKeyframes();  // Only active window keyframes
+        DrawTrajectory(keyframes);
     }
     
     // Draw keyframes as spheres (only window keyframes)
@@ -574,6 +584,65 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
     }
     
     return vis_image;
+}
+
+void VizUtils::SaveTrajectory(const Estimator* estimator) {
+    if (!estimator) {
+        std::cerr << "[VizUtils] Cannot save trajectory: estimator is null" << std::endl;
+        return;
+    }
+    
+    // Use keyframes only
+    const auto& keyframes = estimator->GetKeyframes();
+    if (keyframes.empty()) {
+        std::cerr << "[VizUtils] Cannot save trajectory: no keyframes" << std::endl;
+        return;
+    }
+    
+    // Determine output path
+    std::string output_path;
+    if (!m_data_directory.empty()) {
+        output_path = m_data_directory;
+        if (output_path.back() != '/') output_path += '/';
+        output_path += "estimated_trajectory.txt";
+    } else {
+        output_path = "estimated_trajectory.txt";
+    }
+    
+    std::ofstream file(output_path);
+    if (!file.is_open()) {
+        std::cerr << "[VizUtils] Failed to open file for writing: " << output_path << std::endl;
+        return;
+    }
+    
+    // Write trajectory in TUM format: timestamp tx ty tz qx qy qz qw (no header)
+    file << std::fixed << std::setprecision(9);
+    
+    int saved_count = 0;
+    for (const auto& kf : keyframes) {
+        if (!kf) continue;
+        
+        double timestamp = kf->GetTimestamp();
+        Eigen::Matrix4f T_wb = kf->GetTwb();
+        
+        // Extract translation
+        Eigen::Vector3f t = T_wb.block<3, 1>(0, 3);
+        
+        // Extract rotation and convert to quaternion
+        Eigen::Matrix3f R = T_wb.block<3, 3>(0, 0);
+        Eigen::Quaternionf q(R);
+        q.normalize();
+        
+        // TUM format: timestamp tx ty tz qx qy qz qw
+        file << timestamp << " "
+             << t.x() << " " << t.y() << " " << t.z() << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+        saved_count++;
+    }
+    
+    file.close();
+    std::cout << "[VizUtils] Saved keyframe trajectory to: " << output_path 
+              << " (" << saved_count << " keyframes)" << std::endl;
 }
 
 } // namespace vio_360
