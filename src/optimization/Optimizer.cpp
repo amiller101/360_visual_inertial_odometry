@@ -1598,7 +1598,7 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
     LOG_INFO("========================================================");
     
     // =========================================================================
-    // STAGE 0: Gyro Bias Estimation (Rotation-only, ORB-SLAM3 style)
+    // STAGE 0: Gyro Bias Estimation
     // Compare visual rotation with IMU-integrated rotation
     // =========================================================================
     
@@ -1691,7 +1691,7 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
     }
     
     // =========================================================================
-    // STAGE 1: Initialize Velocity from Visual (ORB-SLAM3 style)
+    // STAGE 1: Initialize Velocity from Visual
     // v_i = (t_{i+1} - t_i) / dt
     // =========================================================================
     
@@ -1728,7 +1728,7 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
     }
     
     // =========================================================================
-    // STAGE 2: Gravity Direction Estimation (ORB-SLAM3 style)
+    // STAGE 2: Gravity Direction Estimation
     // dirG = -sum(R_wb_i * delta_V), then compute R_wg
     // =========================================================================
     

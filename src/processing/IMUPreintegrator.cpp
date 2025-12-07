@@ -217,9 +217,6 @@ void IMUPreintegrator::IntegrateMeasurement(
     // Skew-symmetric matrix of acceleration (for Jacobian computation)
     Eigen::Matrix3f Wacc = SkewSymmetric(accel);
     
-    // =========================================================================
-    // ORB-SLAM3 style: Update P, V FIRST (before rotation update)
-    // =========================================================================
     
     // Update position (uses old dV and dR)
     preint->delta_P = dP + dV * dt + 0.5f * dR * accel * dt * dt;
@@ -227,9 +224,6 @@ void IMUPreintegrator::IntegrateMeasurement(
     // Update velocity (uses old dR)
     preint->delta_V = dV + dR * accel * dt;
     
-    // =========================================================================
-    // Update Jacobians w.r.t. biases (ORB-SLAM3 style, before rotation update)
-    // =========================================================================
     
     // Position Jacobians (must be updated before velocity Jacobians change)
     preint->J_Pa = preint->J_Pa + preint->J_Va * dt - 0.5f * dR * dt * dt;
@@ -239,9 +233,6 @@ void IMUPreintegrator::IntegrateMeasurement(
     preint->J_Va = preint->J_Va - dR * dt;
     preint->J_Vg = preint->J_Vg - dR * dt * Wacc * preint->J_Rg;
     
-    // =========================================================================
-    // Update rotation LAST (ORB-SLAM3 style)
-    // =========================================================================
     
     Eigen::Vector3f omega_dt = gyro * dt;
     Eigen::Matrix3f deltaR = Rodrigues(omega_dt);
@@ -362,7 +353,6 @@ Eigen::Matrix3f IMUPreintegrator::RightJacobian(const Eigen::Vector3f& omega) co
         return Eigen::Matrix3f::Identity() - 0.5f * SkewSymmetric(omega);
     }
     
-    // ORB-SLAM3/Sophus style: use W = hat(omega) directly (not unit axis)
     Eigen::Matrix3f W = SkewSymmetric(omega);
     
     // Right Jacobian: Jr = I - (1-cos(θ))/θ² * W + (θ-sin(θ))/θ³ * W²
