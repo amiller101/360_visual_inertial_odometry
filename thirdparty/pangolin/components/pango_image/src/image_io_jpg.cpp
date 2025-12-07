@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cstdint>
 
+
 #include <pangolin/platform.h>
 
 #include <pangolin/image/typed_image.h>
