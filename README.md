@@ -5,4 +5,5 @@ ToDo List
 - [X] Monocular Initialization
 - [X] Omnidirectional VO
 - [X] IMU Initialization
-- [ ] Omnidirectional VIO
+- [X] Omnidirectional VIO
+- [ ] Multi threading
