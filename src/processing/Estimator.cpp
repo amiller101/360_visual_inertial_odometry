@@ -540,9 +540,16 @@ void Estimator::ProcessIMU(const std::vector<IMUData>& imu_data) {
         return;
     }
     
-    // Get current bias estimates from previous frame
-    Eigen::Vector3f accel_bias = m_previous_frame->GetAccelBias();
-    Eigen::Vector3f gyro_bias = m_previous_frame->GetGyroBias();
+    // Get current bias estimates from last keyframe (BA updates keyframe bias)
+    // Fall back to previous frame if no keyframe exists yet
+    Eigen::Vector3f accel_bias, gyro_bias;
+    if (m_last_keyframe) {
+        accel_bias = m_last_keyframe->GetAccelBias();
+        gyro_bias = m_last_keyframe->GetGyroBias();
+    } else {
+        accel_bias = m_previous_frame->GetAccelBias();
+        gyro_bias = m_previous_frame->GetGyroBias();
+    }
     
     // Set bias in preintegrator
     m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
@@ -732,10 +739,16 @@ std::shared_ptr<Frame> Estimator::CreateFrame(const cv::Mat& image, double times
     // Set camera-to-body extrinsic transformation
     frame->SetTBC(config.T_BC);
     
-    // Copy bias from previous frame (after IMU initialization)
-    if (m_tracking_state == TrackingState::VIO && m_previous_frame) {
-        frame->SetGyroBias(m_previous_frame->GetGyroBias());
-        frame->SetAccelBias(m_previous_frame->GetAccelBias());
+    // Copy bias from last keyframe (BA updates keyframe bias)
+    // Fall back to previous frame if no keyframe exists yet
+    if (m_tracking_state == TrackingState::VIO) {
+        if (m_last_keyframe) {
+            frame->SetGyroBias(m_last_keyframe->GetGyroBias());
+            frame->SetAccelBias(m_last_keyframe->GetAccelBias());
+        } else if (m_previous_frame) {
+            frame->SetGyroBias(m_previous_frame->GetGyroBias());
+            frame->SetAccelBias(m_previous_frame->GetAccelBias());
+        }
     }
     
     return frame;
