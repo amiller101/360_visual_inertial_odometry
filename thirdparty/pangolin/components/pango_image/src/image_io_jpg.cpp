@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <fstream>
-#include <cstdint>
 
 
 #include <pangolin/platform.h>
