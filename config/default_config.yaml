@@ -28,7 +28,7 @@ ransac:
 
 tracking:
   min_features_ratio: 0.5
-  min_parallax_for_keyframe: 10.0  # Minimum parallax (pixels) to create new keyframe
+  min_parallax_for_keyframe: 20.0  # Minimum parallax (pixels) to create new keyframe
   window_size: 10  # Sliding window size for tracking (after initialization)
 
 initialization:

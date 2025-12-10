@@ -95,11 +95,11 @@ target_link_libraries(vio_360_lib
 )
 
 # Main application
-add_executable(feature_tracking_demo
+add_executable(360_vio_example
     app/main.cpp
 )
 
-target_link_libraries(feature_tracking_demo
+target_link_libraries(360_vio_example
     vio_360_lib
     ${OpenCV_LIBS}
     ${OPENGL_LIBRARIES}
@@ -114,7 +114,7 @@ target_link_libraries(feature_tracking_demo
 )
 
 # Set output directory
-set_target_properties(feature_tracking_demo PROPERTIES
+set_target_properties(360_vio_example PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

@@ -15,6 +15,12 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <shared_mutex>
+#include <condition_variable>
+#include <atomic>
 #include <opencv2/opencv.hpp>
 #include <Eigen/Dense>
 
@@ -85,6 +91,23 @@ public:
      * @brief Destructor
      */
     ~Estimator();
+
+    // ============ Backend Thread Control ============
+    
+    /**
+     * @brief Start the backend thread for Local BA
+     */
+    void StartBackendThread();
+    
+    /**
+     * @brief Stop the backend thread
+     */
+    void StopBackendThread();
+    
+    /**
+     * @brief Check if backend thread is running
+     */
+    bool IsBackendRunning() const { return m_backend_running.load(); }
 
     /**
      * @brief Process a new monocular frame
@@ -225,7 +248,32 @@ public:
     void SaveTrajectory(const std::string& output_path) const;
 
 private:
-    // System components
+    // ============ Backend Thread ============
+    std::thread m_backend_thread;
+    std::atomic<bool> m_backend_running{false};
+    std::atomic<bool> m_backend_stop_requested{false};
+    
+    // Keyframe queue for backend processing
+    std::queue<std::shared_ptr<Frame>> m_keyframe_queue;
+    std::mutex m_queue_mutex;
+    std::condition_variable m_queue_cv;
+    
+    // Map mutex for thread-safe access to keyframes and MapPoints
+    // shared_mutex: multiple readers OR single writer
+    mutable std::shared_mutex m_map_mutex;
+    
+    /**
+     * @brief Backend thread main loop
+     */
+    void BackendLoop();
+    
+    /**
+     * @brief Process a keyframe in backend (Local BA)
+     * @param keyframe The keyframe to process
+     */
+    void ProcessKeyframeInBackend(std::shared_ptr<Frame> keyframe);
+
+    // ============ System Components ============
     std::unique_ptr<FeatureTracker> m_feature_tracker;
     std::unique_ptr<Initializer> m_initializer;
     std::unique_ptr<IMUPreintegrator> m_imu_preintegrator;

@@ -28,8 +28,8 @@ namespace vio_360 {
 Optimizer::Optimizer()
     : m_huber_delta(1.0)
     , m_pixel_noise_std(1.0)
-    , m_max_iterations(50)
-    , m_chi2_threshold(9.21)    // Chi-square 99% for 2 DOF (more permissive)
+    , m_max_iterations(50)      // For PnP, initialization
+    , m_chi2_threshold(5.991)    // Chi-square 99% for 2 DOF (more permissive)
     , m_camera(nullptr)
     , m_boundary_margin(20) {
 }
@@ -190,7 +190,8 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
     double final_cost = 0.0;
     int total_iterations = 0;
     
-    ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
+    constexpr int PNP_ITERATIONS_PER_ROUND = 10;
+    ceres::Solver::Options options = SetupSolverOptions(PNP_ITERATIONS_PER_ROUND);
     
     for (int round = 0; round < num_rounds; ++round) {
         // Reset perturbation to zero for each round (right perturbation approach)
@@ -309,6 +310,149 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
     return result;
 }
 
+PnPResult Optimizer::SolvePnPWithSnapshot(
+    std::shared_ptr<Frame> frame,
+    const std::vector<PnPObservation>& observations) {
+    
+    PnPResult result;
+    
+    if (!frame) {
+        LOG_WARN("SolvePnPWithSnapshot: null frame");
+        return result;
+    }
+    
+    if (observations.size() < 6) {
+        LOG_WARN("SolvePnPWithSnapshot: insufficient observations ({})", observations.size());
+        return result;
+    }
+    
+    // Equirectangular camera parameters (cols, rows)
+    double cols = static_cast<double>(frame->GetWidth());
+    double rows = static_cast<double>(frame->GetHeight());
+    factor::CameraParameters cam_params(cols, rows);
+    
+    // Get body-to-camera transform
+    Eigen::Matrix4d T_cb = frame->GetTCB().cast<double>();
+    
+    // Information matrix
+    Eigen::Matrix2d info = Eigen::Matrix2d::Identity() / (m_pixel_noise_std * m_pixel_noise_std);
+    
+    // Store initial pose (for right perturbation approach)
+    Eigen::Matrix4f T_wb_init = frame->GetTwb();
+    Eigen::Matrix4d T_wb_init_d = T_wb_init.cast<double>();
+    
+    // Setup pose parameters as perturbation (initialized to zero)
+    double pose_params[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    
+    // Build optimization problem
+    ceres::Problem problem;
+    std::vector<factor::PnPFactor*> factors;
+    
+    for (const auto& obs : observations) {
+        Eigen::Vector2d pixel_obs(obs.pixel.x, obs.pixel.y);
+        Eigen::Vector3d world_pt = obs.world_point.cast<double>();
+        
+        auto* cost = new factor::PnPFactor(pixel_obs, world_pt, cam_params, T_cb, T_wb_init_d, info);
+        factors.push_back(cost);
+        
+        // Marginalized MapPoints get 2x weight
+        double weight = obs.is_marginalized ? 2.0 : 1.0;
+        ceres::LossFunction* loss = new ceres::HuberLoss(m_huber_delta);
+        if (weight > 1.0) {
+            loss = new ceres::ScaledLoss(loss, weight, ceres::TAKE_OWNERSHIP);
+        }
+        
+        problem.AddResidualBlock(cost, loss, pose_params);
+    }
+    
+    // 4-round outlier detection
+    const int num_rounds = 4;
+    double initial_cost = 0.0;
+    double final_cost = 0.0;
+    int total_iterations = 0;
+    
+    constexpr int PNP_ITERATIONS_PER_ROUND = 10;
+    ceres::Solver::Options options = SetupSolverOptions(PNP_ITERATIONS_PER_ROUND);
+    
+    for (int round = 0; round < num_rounds; ++round) {
+        if (round > 0) {
+            std::fill(pose_params, pose_params + 6, 0.0);
+        }
+        
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        
+        if (round == 0) {
+            initial_cost = summary.initial_cost;
+        }
+        final_cost = summary.final_cost;
+        total_iterations += summary.iterations.size();
+        
+        // Mark outliers based on bearing angle error
+        int outliers_this_round = 0;
+        double* params_ptr = pose_params;
+        
+        for (size_t i = 0; i < factors.size(); ++i) {
+            if (factors[i]->is_outlier()) continue;
+            
+            double angle_error = factors[i]->compute_bearing_angle_error(&params_ptr);
+            double threshold_rad = (m_chi2_threshold * M_PI / 180.0);  // degrees to radians
+            
+            if (angle_error > threshold_rad) {
+                factors[i]->set_outlier(true);
+                outliers_this_round++;
+            }
+        }
+        
+        if (outliers_this_round == 0) break;
+    }
+    
+    // Count inliers/outliers
+    result.num_inliers = 0;
+    result.num_outliers = 0;
+    for (const auto& f : factors) {
+        if (f->is_outlier()) {
+            result.num_outliers++;
+        } else {
+            result.num_inliers++;
+        }
+    }
+    
+    result.success = (result.num_inliers >= 10);
+    
+    // Compute final pose
+    Eigen::Matrix<double, 6, 1> delta_xi;
+    delta_xi << pose_params[0], pose_params[1], pose_params[2],
+                pose_params[3], pose_params[4], pose_params[5];
+    
+    SE3d T_wb_init_se3(T_wb_init_d);
+    SE3d delta_T = SE3d::exp(delta_xi);
+    SE3d T_wb_final = T_wb_init_se3 * delta_T;
+    result.optimized_pose = T_wb_final.matrix().cast<float>();
+    
+    // Safety check
+    Eigen::Vector3f old_pos = T_wb_init.block<3,1>(0,3);
+    Eigen::Vector3f new_pos = result.optimized_pose.block<3,1>(0,3);
+    float pos_change = (new_pos - old_pos).norm();
+    
+    const int min_inliers_for_update = 10;
+    const float max_pose_change = 0.5f;
+    
+    if (result.num_inliers < min_inliers_for_update) {
+        LOG_WARN("  PnP rejected: too few inliers ({} < {})", result.num_inliers, min_inliers_for_update);
+        result.success = false;
+        result.optimized_pose = T_wb_init;
+    } else {
+        frame->SetTwb(result.optimized_pose);
+    }
+    
+    result.initial_cost = initial_cost;
+    result.final_cost = final_cost;
+    result.num_iterations = total_iterations;
+    
+    return result;
+}
+
 BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
                           bool fix_first_pose,
                           bool fix_last_pose) {
@@ -421,8 +565,9 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
         problem.SetParameterBlockConstant(pose_params.back().data());
     }
     
-    // Solve
-    ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
+    // Solve - use more iterations for initialization
+    constexpr int INIT_MAX_ITERATIONS = 200;
+    ceres::Solver::Options options = SetupSolverOptions(INIT_MAX_ITERATIONS);
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -762,7 +907,8 @@ BAResult Optimizer::RunLocalBAwithInertial(const std::vector<std::shared_ptr<Fra
              ba_factors.size(), imu_factor_count);
     
     // ==================== Step 5: Solve ====================
-    ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
+    constexpr int BA_MAX_ITERATIONS = 10;  // Limit BA iterations for speed
+    ceres::Solver::Options options = SetupSolverOptions(BA_MAX_ITERATIONS);
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -845,7 +991,7 @@ BAResult Optimizer::RunLocalBAwithInertial(const std::vector<std::shared_ptr<Fra
             
             // Increment BA count and marginalize if optimized at least once
             mappoints[i]->IncrementBACount();
-            if (mappoints[i]->GetBACount() >= 1) {
+            if (mappoints[i]->GetBACount() >= 5) {
                 mappoints[i]->SetMarginalized(true);
                 newly_marginalized++;
             }
@@ -1403,7 +1549,8 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
              window_frames.size(), fixed_count, optimized_count, mappoints.size(), fixed_mp_count, optimized_mp_count, factors.size());
     
     // Solve
-    ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
+    constexpr int BA_MAX_ITERATIONS = 10;  // Limit BA iterations for speed
+    ceres::Solver::Options options = SetupSolverOptions(BA_MAX_ITERATIONS);
     options.linear_solver_type = ceres::SPARSE_SCHUR;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);

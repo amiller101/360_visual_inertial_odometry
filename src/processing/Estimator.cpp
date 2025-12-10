@@ -18,6 +18,7 @@
 #include "Camera.h"
 #include "Frame.h"
 #include "Feature.h"
+#include <chrono>
 #include "MapPoint.h"
 #include "ConfigUtils.h"
 #include "Logger.h"
@@ -31,7 +32,7 @@ Estimator::Estimator()
     , m_tracking_state(TrackingState::NOT_INITIALIZED)
     , m_current_pose(Eigen::Matrix4f::Identity())
     , m_transform_from_last(Eigen::Matrix4f::Identity())
-    , m_gravity(0, 0, -9.81f)
+    , m_gravity(0, 0, -ConfigUtils::GetInstance().imu_gravity_magnitude)
     , m_gyro_bias(Eigen::Vector3f::Zero())
     , m_accel_bias(Eigen::Vector3f::Zero())
     , m_scale(1.0)
@@ -74,13 +75,139 @@ Estimator::Estimator()
     m_window_size = m_init_window_size;  // Start with init window size
     m_min_parallax = config.initialization_min_parallax;
     m_frame_window.reserve(m_window_size);
+    
+    // Start backend thread
+    StartBackendThread();
 }
 
 Estimator::~Estimator() {
-    // Cleanup if needed
+    // Stop backend thread
+    StopBackendThread();
+}
+
+// ============ Backend Thread Implementation ============
+
+void Estimator::StartBackendThread() {
+    if (m_backend_running.load()) {
+        LOG_WARN("Backend thread is already running");
+        return;
+    }
+    
+    m_backend_stop_requested.store(false);
+    m_backend_running.store(true);
+    m_backend_thread = std::thread(&Estimator::BackendLoop, this);
+    LOG_INFO("Backend thread started");
+}
+
+void Estimator::StopBackendThread() {
+    if (!m_backend_running.load()) {
+        return;
+    }
+    
+    // Signal thread to stop
+    m_backend_stop_requested.store(true);
+    
+    // Wake up the thread if it's waiting
+    {
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
+        m_queue_cv.notify_all();
+    }
+    
+    // Wait for thread to finish
+    if (m_backend_thread.joinable()) {
+        m_backend_thread.join();
+    }
+    
+    m_backend_running.store(false);
+    LOG_INFO("Backend thread stopped");
+}
+
+void Estimator::BackendLoop() {
+    LOG_INFO("Backend loop started");
+    
+    while (!m_backend_stop_requested.load()) {
+        std::shared_ptr<Frame> keyframe_to_process;
+        
+        // Wait for keyframe in queue
+        {
+            std::unique_lock<std::mutex> lock(m_queue_mutex);
+            m_queue_cv.wait(lock, [this] {
+                return !m_keyframe_queue.empty() || m_backend_stop_requested.load();
+            });
+            
+            if (m_backend_stop_requested.load()) {
+                break;
+            }
+            
+            if (!m_keyframe_queue.empty()) {
+                keyframe_to_process = m_keyframe_queue.front();
+                m_keyframe_queue.pop();
+            }
+        }
+        
+        // Process keyframe (Local BA)
+        if (keyframe_to_process) {
+            ProcessKeyframeInBackend(keyframe_to_process);
+        }
+    }
+    
+    LOG_INFO("Backend loop exited");
+}
+
+void Estimator::ProcessKeyframeInBackend(std::shared_ptr<Frame> keyframe) {
+    LOG_DEBUG("Backend processing keyframe {}", keyframe->GetFrameId());
+    
+    // Lock entire BA process
+    std::unique_lock<std::shared_mutex> lock(m_map_mutex);
+    
+    // Find previous keyframe
+    std::shared_ptr<Frame> prev_keyframe = nullptr;
+    if (m_keyframes.size() >= 2) {
+        for (int i = static_cast<int>(m_keyframes.size()) - 2; i >= 0; --i) {
+            if (m_keyframes[i]->GetFrameId() < keyframe->GetFrameId()) {
+                prev_keyframe = m_keyframes[i];
+                break;
+            }
+        }
+    }
+    
+    // Triangulate new MapPoints
+    int new_points = 0;
+    if (prev_keyframe) {
+        new_points = TriangulateNewMapPoints(prev_keyframe, keyframe);
+    }
+    
+    // Run BA
+    if (new_points > 0 && m_keyframes.size() >= 2) {
+        Optimizer optimizer;
+        optimizer.SetCamera(m_camera, m_boundary_margin);
+        
+        BAResult ba_result;
+        if (m_tracking_state == TrackingState::VIO) {
+            ba_result = optimizer.RunLocalBAwithInertial(m_keyframes, m_gravity);
+            
+            // Update bias
+            auto last_kf = m_keyframes.back();
+            Eigen::Vector3f new_gyro_bias = last_kf->GetGyroBias();
+            Eigen::Vector3f new_accel_bias = last_kf->GetAccelBias();
+            UpdatePreintegrationsWithNewBias(new_gyro_bias, new_accel_bias);
+        } else {
+            ba_result = optimizer.RunLocalBA(m_keyframes);
+        }
+        
+        LOG_DEBUG("Backend BA: {} keyframes, {} inliers, {} outliers, cost {:.2f}->{:.2f}",
+                 m_keyframes.size(), ba_result.num_inliers, ba_result.num_outliers,
+                 ba_result.initial_cost, ba_result.final_cost);
+        
+        // Update current pose
+        if (!m_keyframes.empty()) {
+            m_current_pose = m_keyframes.back()->GetTwb();
+        }
+    }
 }
 
 Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double timestamp) {
+    auto frame_start = std::chrono::high_resolution_clock::now();
     EstimationResult result;
     
     // Create new frame
@@ -173,7 +300,27 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
         if (valid_mp_count >= 6) {
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
-            PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
+            
+            // Collect snapshot of MapPoint positions under shared lock
+            std::vector<Optimizer::PnPObservation> observations;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_map_mutex);
+                const auto& feats = m_current_frame->GetFeatures();
+                for (size_t i = 0; i < feats.size(); ++i) {
+                    if (!feats[i] || !feats[i]->IsValid()) continue;
+                    auto mp = m_current_frame->GetMapPoint(static_cast<int>(i));
+                    if (mp && !mp->IsBad()) {
+                        observations.emplace_back(
+                            feats[i]->GetPixelCoord(),
+                            mp->GetPosition(),
+                            i,
+                            mp->IsMarginalized()
+                        );
+                    }
+                }
+            }
+            // PnP runs outside the lock using copied data
+            PnPResult pnp_result = optimizer.SolvePnPWithSnapshot(m_current_frame, observations);
             
             if (pnp_result.success) {
                 if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
@@ -223,6 +370,7 @@ Estimator::EstimationResult Estimator::ProcessFrame(
     double timestamp,
     const std::vector<IMUData>& imu_data
 ) {
+    auto frame_start = std::chrono::high_resolution_clock::now();
     EstimationResult result;
     
     // Create new frame first
@@ -360,7 +508,27 @@ Estimator::EstimationResult Estimator::ProcessFrame(
         if (valid_mp_count >= 6) {
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
-            PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
+            
+            // Collect snapshot of MapPoint positions under shared lock
+            std::vector<Optimizer::PnPObservation> observations;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_map_mutex);
+                const auto& feats = m_current_frame->GetFeatures();
+                for (size_t i = 0; i < feats.size(); ++i) {
+                    if (!feats[i] || !feats[i]->IsValid()) continue;
+                    auto mp = m_current_frame->GetMapPoint(static_cast<int>(i));
+                    if (mp && !mp->IsBad()) {
+                        observations.emplace_back(
+                            feats[i]->GetPixelCoord(),
+                            mp->GetPosition(),
+                            i,
+                            mp->IsMarginalized()
+                        );
+                    }
+                }
+            }
+            // PnP runs outside the lock using copied data
+            PnPResult pnp_result = optimizer.SolvePnPWithSnapshot(m_current_frame, observations);
             
             if (pnp_result.success) {
                 if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
@@ -471,7 +639,27 @@ Estimator::EstimationResult Estimator::ProcessFrame(
         if (valid_mp_count >= 6) {
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
-            PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
+            
+            // Collect snapshot of MapPoint positions under shared lock
+            std::vector<Optimizer::PnPObservation> observations;
+            {
+                std::shared_lock<std::shared_mutex> lock(m_map_mutex);
+                const auto& feats = m_current_frame->GetFeatures();
+                for (size_t i = 0; i < feats.size(); ++i) {
+                    if (!feats[i] || !feats[i]->IsValid()) continue;
+                    auto mp = m_current_frame->GetMapPoint(static_cast<int>(i));
+                    if (mp && !mp->IsBad()) {
+                        observations.emplace_back(
+                            feats[i]->GetPixelCoord(),
+                            mp->GetPosition(),
+                            i,
+                            mp->IsMarginalized()
+                        );
+                    }
+                }
+            }
+            // PnP runs outside the lock using copied data
+            PnPResult pnp_result = optimizer.SolvePnPWithSnapshot(m_current_frame, observations);
             
             if (pnp_result.success) {
                 if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
@@ -498,8 +686,19 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                     Eigen::AngleAxisf aa(R_err);
                     float rot_error_deg = aa.angle() * 180.0f / M_PI;
                     
-                    LOG_INFO("Frame {}: pos_err={:.4f}m, rot_err={:.3f}deg",
-                             m_current_frame->GetFrameId(), pos_error, rot_error_deg);
+                    // Count tracked mappoints
+                    int tracked_mp_count = 0;
+                    const auto& feats = m_current_frame->GetFeatures();
+                    for (size_t i = 0; i < feats.size(); ++i) {
+                        auto mp = m_current_frame->GetMapPoint(static_cast<int>(i));
+                        if (mp && !mp->IsBad()) tracked_mp_count++;
+                    }
+                    
+                    auto frame_end = std::chrono::high_resolution_clock::now();
+                    double frame_time_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
+                    
+                    LOG_INFO("Frame {}: MPs={}, time={:.1f}ms",
+                             m_current_frame->GetFrameId(), tracked_mp_count, frame_time_ms);
                 }
             } else {
                 LOG_WARN("Frame {}: PnP failed in VIO", m_current_frame->GetFrameId());
@@ -710,7 +909,7 @@ void Estimator::Reset() {
     m_last_keyframe_time = -1.0;
     m_current_pose = Eigen::Matrix4f::Identity();
     m_transform_from_last = Eigen::Matrix4f::Identity();
-    m_gravity = Eigen::Vector3f(0, 0, -9.81f);
+    m_gravity = Eigen::Vector3f(0, 0, -ConfigUtils::GetInstance().imu_gravity_magnitude);
     m_gyro_bias = Eigen::Vector3f::Zero();
     m_accel_bias = Eigen::Vector3f::Zero();
     m_scale = 1.0;
@@ -924,41 +1123,22 @@ void Estimator::CreateKeyframe() {
         m_keyframes.erase(m_keyframes.begin());  // Remove oldest (front)
     }
     
-    // Triangulate new MapPoints between previous keyframe and current keyframe
-    int new_points = 0;
-    if (prev_keyframe) {
-        new_points = TriangulateNewMapPoints(prev_keyframe, m_current_frame);
+    // Queue this keyframe for backend processing (Triangulation + Local BA)
+    // Lock and enqueue keyframe for backend thread
+    {
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
+        m_keyframe_queue.push(m_current_frame);
+        m_queue_cv.notify_one();
     }
     
-    // Run BA if we have new MapPoints
-    if (new_points > 0 && m_keyframes.size() >= 2) {
-        Optimizer optimizer;
-        optimizer.SetCamera(m_camera, m_boundary_margin);
-        
-        BAResult ba_result;
-        if (m_tracking_state == TrackingState::VIO) {
-            // Visual-Inertial BA with individual bias per frame
-            ba_result = optimizer.RunLocalBAwithInertial(m_keyframes, m_gravity);
-            
-            // Get updated bias from last keyframe
-            auto last_kf = m_keyframes.back();
-            Eigen::Vector3f new_gyro_bias = last_kf->GetGyroBias();
-            Eigen::Vector3f new_accel_bias = last_kf->GetAccelBias();
-            
-            // Update all preintegrations with new bias
-            UpdatePreintegrationsWithNewBias(new_gyro_bias, new_accel_bias);
-        } else {
-            // Visual-only Local BA before IMU initialization
-            ba_result = optimizer.RunLocalBA(m_keyframes);
-        }
-        
-        // Update m_current_pose with BA-optimized pose
-        m_current_pose = m_current_frame->GetTwb();
-        
-        // Reset m_transform_from_last to identity after BA
-        // Next frame will start from the BA-optimized keyframe pose
-        m_transform_from_last = Eigen::Matrix4f::Identity();
-    }
+    // Backend runs asynchronously - no waiting here!
+    // PnP will use m_map_mutex when reading MapPoints
+    
+    // Update current pose (will be refined by backend BA later)
+    m_current_pose = m_current_frame->GetTwb();
+    
+    // Reset m_transform_from_last to identity after keyframe creation
+    m_transform_from_last = Eigen::Matrix4f::Identity();
     
     // Note: IMU initialization is now handled in ProcessFrame VISUAL_ONLY state
 }
@@ -1560,7 +1740,7 @@ bool Estimator::TryInitializeIMU() {
     ApplyGravityAlignmentTransform(result.Rwg, 1.0f);
     
     // Update gravity to point in -Z direction (after transformation)
-    m_gravity = Eigen::Vector3f(0.0f, 0.0f, -9.81f);
+    m_gravity = Eigen::Vector3f(0.0f, 0.0f, -ConfigUtils::GetInstance().imu_gravity_magnitude);
     
     // Note: m_tracking_state transition to VIO is done in ProcessFrame after TryInitializeIMU returns true
     
@@ -1799,11 +1979,12 @@ bool Estimator::TryInitializeIMUWithInterpolation() {
     LOG_INFO("  Raw gravity: [{:.4f}, {:.4f}, {:.4f}] (norm={:.4f})",
              gravity_dir.x(), gravity_dir.y(), gravity_dir.z(), gravity_norm);
     
-    // Normalize to 9.81
+    // Normalize to gravity magnitude from config
+    const double g_mag = ConfigUtils::GetInstance().imu_gravity_magnitude;
     if (gravity_norm > 0.1) {
-        gravity_dir = gravity_dir.normalized() * 9.81;
+        gravity_dir = gravity_dir.normalized() * g_mag;
     } else {
-        gravity_dir = Eigen::Vector3d(0, 0, -9.81);  // Default
+        gravity_dir = Eigen::Vector3d(0, 0, -g_mag);  // Default
     }
     
     m_gravity = gravity_dir.cast<float>();
@@ -1876,7 +2057,7 @@ bool Estimator::TryInitializeIMUWithInterpolation() {
     ApplyGravityAlignmentTransform(Rwg.cast<float>(), 1.0f);
     
     // Update gravity to point in -Z direction (after transformation)
-    m_gravity = Eigen::Vector3f(0.0f, 0.0f, -9.81f);
+    m_gravity = Eigen::Vector3f(0.0f, 0.0f, -ConfigUtils::GetInstance().imu_gravity_magnitude);
     
     return true;
 }
@@ -2040,48 +2221,47 @@ void Estimator::ApplyGravityAlignmentTransform(const Eigen::Matrix3f& Rwg, float
 }
 
 void Estimator::ShrinkWindowAfterInit() {
-    // Shrink window from initialization size to tracking size
-    // Keep only the most recent m_tracking_window_size keyframes
+    // After IMU init, keep only first and last keyframes (2 keyframes)
+    // This removes intermediate initialization keyframes
     
-    LOG_INFO("Shrinking window after init: {} -> {} keyframes", 
-             m_keyframes.size(), m_tracking_window_size);
+    if (m_keyframes.size() <= 2) {
+        LOG_INFO("ShrinkWindowAfterInit: already have {} keyframes, no shrinking needed", m_keyframes.size());
+        return;
+    }
     
-    // Update window size to tracking size
-    m_window_size = m_tracking_window_size;
+    LOG_INFO("Shrinking window after IMU init: {} -> 2 keyframes (first + last)", m_keyframes.size());
     
-    // Remove oldest keyframes until we reach tracking window size
-    while (static_cast<int>(m_keyframes.size()) > m_tracking_window_size) {
-        auto oldest_keyframe = m_keyframes.front();
+    // Keep first and last keyframe
+    auto first_keyframe = m_keyframes.front();
+    auto last_keyframe = m_keyframes.back();
+    
+    // Process intermediate keyframes (remove them)
+    for (size_t kf_idx = 1; kf_idx < m_keyframes.size() - 1; ++kf_idx) {
+        auto intermediate_kf = m_keyframes[kf_idx];
         
-        // Save pose before removing from window (for trajectory output)
+        // Save pose for trajectory output
         m_marginalized_poses.emplace_back(
-            oldest_keyframe->GetTimestamp(),
-            oldest_keyframe->GetTwb()
+            intermediate_kf->GetTimestamp(),
+            intermediate_kf->GetTwb()
         );
         
-        // Handle MapPoints whose reference keyframe is being removed
-        const auto& old_kf_features = oldest_keyframe->GetFeatures();
+        // Handle MapPoints
+        const auto& kf_features = intermediate_kf->GetFeatures();
         int transferred_count = 0;
         int deleted_count = 0;
         
-        for (size_t i = 0; i < old_kf_features.size(); ++i) {
-            auto mp = oldest_keyframe->GetMapPoint(static_cast<int>(i));
+        for (size_t i = 0; i < kf_features.size(); ++i) {
+            auto mp = intermediate_kf->GetMapPoint(static_cast<int>(i));
             if (mp && !mp->IsBad()) {
-                // Check if this keyframe is the reference for this MapPoint
-                if (mp->IsReferenceKeyframe(oldest_keyframe)) {
-                    // Find the oldest remaining keyframe that observes this MapPoint
-                    std::shared_ptr<Frame> new_ref_keyframe = nullptr;
-                    
-                    for (size_t kf_idx = 1; kf_idx < m_keyframes.size(); ++kf_idx) {
-                        auto& kf = m_keyframes[kf_idx];
-                        if (mp->IsObservedByFrame(kf)) {
-                            new_ref_keyframe = kf;
-                            break;
-                        }
-                    }
-                    
-                    if (new_ref_keyframe) {
-                        mp->SetReferenceKeyframe(new_ref_keyframe);
+                // Transfer reference to first or last keyframe if needed
+                if (mp->IsReferenceKeyframe(intermediate_kf)) {
+                    // Try to transfer to last keyframe first (most recent)
+                    if (mp->IsObservedByFrame(last_keyframe)) {
+                        mp->SetReferenceKeyframe(last_keyframe);
+                        mp->SetMarginalized(true);
+                        transferred_count++;
+                    } else if (mp->IsObservedByFrame(first_keyframe)) {
+                        mp->SetReferenceKeyframe(first_keyframe);
                         mp->SetMarginalized(true);
                         transferred_count++;
                     } else {
@@ -2089,25 +2269,29 @@ void Estimator::ShrinkWindowAfterInit() {
                         deleted_count++;
                     }
                 }
-            }
-        }
-        
-        // Clean up observations from MapPoints
-        for (size_t i = 0; i < old_kf_features.size(); ++i) {
-            auto mp = oldest_keyframe->GetMapPoint(static_cast<int>(i));
-            if (mp && !mp->IsBad()) {
-                mp->RemoveObservation(oldest_keyframe);
+                
+                // Remove observation from intermediate keyframe
+                mp->RemoveObservation(intermediate_kf);
                 if (mp->GetObservationCount() == 0) {
                     mp->SetBad(true);
                 }
             }
         }
         
-        LOG_DEBUG("  Removed kf {}: {} MPs transferred, {} deleted", 
-                 oldest_keyframe->GetFrameId(), transferred_count, deleted_count);
-        
-        m_keyframes.erase(m_keyframes.begin());
+        LOG_DEBUG("  Removed intermediate kf {}: {} MPs transferred, {} deleted", 
+                 intermediate_kf->GetFrameId(), transferred_count, deleted_count);
     }
+    
+    // Keep only first and last
+    m_keyframes.clear();
+    m_keyframes.push_back(first_keyframe);
+    m_keyframes.push_back(last_keyframe);
+    
+    // Update window size to tracking size
+    m_window_size = m_tracking_window_size;
+    
+    // Update last keyframe reference
+    m_last_keyframe = last_keyframe;
     
     // Switch feature tracker to TRACKING settings
     const auto& config = ConfigUtils::GetInstance();
@@ -2116,8 +2300,8 @@ void Estimator::ShrinkWindowAfterInit() {
     m_feature_tracker->SetQualityLevel(static_cast<float>(config.quality_level));
     m_feature_tracker->SetGridParams(config.grid_cols, config.grid_rows, config.max_features_per_grid);
     
-    LOG_INFO("Window shrunk: {} keyframes remaining, {} marginalized poses saved",
-             m_keyframes.size(), m_marginalized_poses.size());
+    LOG_INFO("Window shrunk: 2 keyframes remaining (first={}, last={}), {} marginalized poses saved",
+             first_keyframe->GetFrameId(), last_keyframe->GetFrameId(), m_marginalized_poses.size());
     LOG_INFO("Feature tracker switched to tracking settings: max_features={}, min_distance={:.1f}",
              config.max_features, config.min_distance);
 }

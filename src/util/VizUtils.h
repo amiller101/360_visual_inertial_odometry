@@ -120,7 +120,8 @@ public:
      */
     cv::Mat DrawTracking(const cv::Mat& image,
                          std::shared_ptr<Frame> current_frame,
-                         std::shared_ptr<Frame> previous_frame);
+                         std::shared_ptr<Frame> previous_frame,
+                         bool imu_initialized);
 
 private:
     // Window dimensions

@@ -176,6 +176,11 @@ int main(int argc, char** argv) {
     std::shared_ptr<vio_360::Frame> prev_frame = nullptr;
     double prev_timestamp = 0.0;
     
+    // For 30fps playback timing
+    auto last_frame_time = std::chrono::steady_clock::now();
+    constexpr double TARGET_FPS = 30.0;
+    constexpr auto TARGET_FRAME_DURATION = std::chrono::microseconds(static_cast<int>(1000000.0 / TARGET_FPS));
+    
     for (size_t i = 0; i < image_files.size(); ++i) {
         if (viz->ShouldClose()) break;
         
@@ -189,6 +194,9 @@ int main(int argc, char** argv) {
             }
             // Step requested - proceed with this frame
         }
+        
+        // Frame timing for 30fps playback
+        auto frame_start = std::chrono::steady_clock::now();
         
         double current_timestamp = cam_timestamps[i];
         
@@ -221,6 +229,13 @@ int main(int argc, char** argv) {
         
         prev_frame = current_frame;
         prev_timestamp = current_timestamp;
+        
+        // Sleep to maintain 30fps playback
+        auto frame_end = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start);
+        if (elapsed < TARGET_FRAME_DURATION) {
+            std::this_thread::sleep_for(TARGET_FRAME_DURATION - elapsed);
+        }
     }
     
     LOG_INFO("Processing complete: {} frames, initialized={}",

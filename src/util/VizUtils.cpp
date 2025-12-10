@@ -15,6 +15,7 @@
 #include "Frame.h"
 #include "Feature.h"
 #include "MapPoint.h"
+#include "ConfigUtils.h"
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -50,7 +51,7 @@ void VizUtils::Initialize() {
     m_s_cam = std::make_unique<pangolin::OpenGlRenderState>(
         pangolin::ProjectionMatrix(view_width, view_height, 500, 500, 
                                    view_width/2, view_height/2, 0.1, 1000),
-        pangolin::ModelViewLookAt(0, -5, -10, 0, 0, 0, pangolin::AxisZ)
+        pangolin::ModelViewLookAt(0, -5, 10, 0, 0, 0, pangolin::AxisZ)
     );
     
     // Create Interactive View in window
@@ -141,7 +142,8 @@ void VizUtils::Update(const Estimator* estimator,
         // Create tracking visualization
         cv::Mat tracking_image = DrawTracking(current_frame->GetImage(), 
                                               current_frame, 
-                                              previous_frame);
+                                              previous_frame,
+                                              estimator->IsIMUInitialized());
         
         cv::Mat rgb_image;
         if (tracking_image.channels() == 1) {
@@ -192,17 +194,55 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
         DrawAxis(1.0f);
     }
     
-    // Draw MapPoints currently being tracked (with matching colors from tracking view)
-    if (*m_show_init_result && estimator->IsInitialized()) {
+    // Draw MapPoints only after IMU initialization
+    if (*m_show_init_result && estimator->IsIMUInitialized()) {
+        // 1. Draw all window MapPoints in WHITE (size 1)
+        const auto& keyframes = estimator->GetKeyframes();
+        std::set<std::shared_ptr<MapPoint>> window_mappoints;
+        
+        for (const auto& kf : keyframes) {
+            const auto& features = kf->GetFeatures();
+            for (size_t i = 0; i < features.size(); ++i) {
+                auto mp = kf->GetMapPoint(static_cast<int>(i));
+                if (mp && !mp->IsBad()) {
+                    window_mappoints.insert(mp);
+                }
+            }
+        }
+        
+        glPointSize(3.0f);
+        glBegin(GL_POINTS);
+        glColor3f(1.0f, 1.0f, 1.0f);  // White
+        
+        for (const auto& mp : window_mappoints) {
+            Eigen::Vector3f pt = mp->GetPosition();
+            glVertex3f(pt.x(), pt.y(), pt.z());
+        }
+        glEnd();
+        
+        // 2. Draw currently tracked MapPoints with observation-based colors (size 5)
         if (!m_current_tracked_mappoints.empty()) {
-            glPointSize(static_cast<float>(*m_point_size) * 2.0f);
+            glPointSize(5.0f);
             glBegin(GL_POINTS);
+            
+            const int MIN_OBS = 2;
+            const int MAX_OBS = 10;
             
             for (size_t i = 0; i < m_current_tracked_mappoints.size(); ++i) {
                 const auto& mp = m_current_tracked_mappoints[i];
                 if (mp && !mp->IsBad()) {
-                    const Eigen::Vector3f& color = m_current_tracked_colors[i];
-                    glColor3f(color.x(), color.y(), color.z());
+                    // Same color logic as tracking view: yellow -> red by observation count
+                    int obs_count = mp->GetObservationCount();
+                    float ratio = static_cast<float>(std::min(obs_count, MAX_OBS) - MIN_OBS) / 
+                                 static_cast<float>(MAX_OBS - MIN_OBS);
+                    ratio = std::max(0.0f, std::min(1.0f, ratio));
+                    
+                    // Yellow (1, 1, 0) -> Red (1, 0, 0) in RGB
+                    float r = 1.0f;
+                    float g = 1.0f - ratio;
+                    float b = 0.0f;
+                    glColor3f(r, g, b);
+                    
                     Eigen::Vector3f pt = mp->GetPosition();
                     glVertex3f(pt.x(), pt.y(), pt.z());
                 }
@@ -227,16 +267,22 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
             Eigen::Matrix4f T_wb = kf->GetTwb();
             Eigen::Vector3f pos = T_wb.block<3, 1>(0, 3);
             
-            glColor3f(0.0f, 0.9f, 0.7f);  // Mint color for window keyframes
+            // Enable blending for transparency
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glColor4f(0.0f, 0.9f, 0.7f, 0.5f);  // Mint color with 50% alpha
+            glLineWidth(1.0f);  // Thin wireframe
             
             // Draw wireframe sphere
             glPushMatrix();
             glTranslatef(pos.x(), pos.y(), pos.z());
             GLUquadric* quad = gluNewQuadric();
             gluQuadricDrawStyle(quad, GLU_LINE);  // Wireframe style
-            gluSphere(quad, 0.15, 12, 8);  // radius=0.15 (10x larger), slices=12, stacks=8
+            gluSphere(quad, 0.15, 8, 6);  // radius=0.15, fewer slices for thinner look
             gluDeleteQuadric(quad);
             glPopMatrix();
+            
+            glDisable(GL_BLEND);
         }
     }
     
@@ -494,12 +540,32 @@ void VizUtils::GetColorFromXForGL(float x, float width, float& r, float& g, floa
 
 cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
                                std::shared_ptr<Frame> current_frame,
-                               std::shared_ptr<Frame> previous_frame) {
+                               std::shared_ptr<Frame> previous_frame,
+                               bool imu_initialized) {
     cv::Mat vis_image;
     if (image.channels() == 1) {
         cv::cvtColor(image, vis_image, cv::COLOR_GRAY2BGR);
     } else {
         vis_image = image.clone();
+    }
+    
+    // Draw grid lines (light green, semi-transparent)
+    const auto& config = ConfigUtils::GetInstance();
+    int grid_cols = config.grid_cols;
+    int grid_rows = config.grid_rows;
+    cv::Scalar grid_color(144, 238, 144);  // Light green (BGR)
+    int grid_thickness = 1;
+    
+    // Draw vertical grid lines
+    for (int i = 1; i < grid_cols; ++i) {
+        int x = i * image.cols / grid_cols;
+        cv::line(vis_image, cv::Point(x, 0), cv::Point(x, image.rows), grid_color, grid_thickness);
+    }
+    
+    // Draw horizontal grid lines
+    for (int i = 1; i < grid_rows; ++i) {
+        int y = i * image.rows / grid_rows;
+        cv::line(vis_image, cv::Point(0, y), cv::Point(image.cols, y), grid_color, grid_thickness);
     }
     
     if (!current_frame) return vis_image;
@@ -553,30 +619,55 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
     }
     
     // Draw feature points
+    // Before IMU init: green
+    // After IMU init: yellow (few obs) -> red (many obs)
     int inlier_count = 0;
+    const int MIN_OBS = 2;   // Minimum observations (yellow)
+    const int MAX_OBS = 10;  // Maximum observations for full red
+    
     for (size_t i = 0; i < features.size(); ++i) {
         const auto& feature = features[i];
         
-        // After initialization: only draw inliers with valid MapPoints
+        // After map initialization: only draw inliers with valid MapPoints
         if (has_mappoints) {
             auto mp = current_frame->GetMapPoint(static_cast<int>(i));
             if (!mp || mp->IsBad()) {
                 continue;  // Skip outliers
             }
             
-            // Store MapPoint and its color for 3D visualization
             cv::Point2f pt = feature->GetPixelCoord();
-            float r, g, b;
-            GetColorFromXForGL(pt.x, img_width, r, g, b);
-            m_current_tracked_mappoints.push_back(mp);
-            m_current_tracked_colors.push_back(Eigen::Vector3f(r, g, b));
+            
+            if (imu_initialized) {
+                // After IMU init: color by observation count (yellow -> red)
+                int obs_count = mp->GetObservationCount();
+                float ratio = static_cast<float>(std::min(obs_count, MAX_OBS) - MIN_OBS) / 
+                             static_cast<float>(MAX_OBS - MIN_OBS);
+                ratio = std::max(0.0f, std::min(1.0f, ratio));
+                
+                // Yellow (0, 255, 255) -> Red (0, 0, 255) in BGR
+                int r_val = 255;
+                int g_val = static_cast<int>(255 * (1.0f - ratio));
+                int b_val = 0;
+                cv::Scalar color(b_val, g_val, r_val);  // BGR
+                cv::circle(vis_image, pt, 5, color, -1, cv::LINE_AA);
+                
+                // Store MapPoint and its color for 3D visualization (only after IMU init)
+                float r, g, b;
+                GetColorFromXForGL(pt.x, img_width, r, g, b);
+                m_current_tracked_mappoints.push_back(mp);
+                m_current_tracked_colors.push_back(Eigen::Vector3f(r, g, b));
+            } else {
+                // Before IMU init: draw in green, don't add to 3D view
+                cv::circle(vis_image, pt, 5, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+            }
+            
+            inlier_count++;
+        } else {
+            // Before initialization: draw all features in green
+            cv::Point2f pt = feature->GetPixelCoord();
+            cv::circle(vis_image, pt, 5, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+            inlier_count++;
         }
-        
-        cv::Point2f pt = feature->GetPixelCoord();
-        // Use x-position based color: blue (left) -> red (right)
-        cv::Scalar color = GetColorFromX(pt.x, img_width);
-        cv::circle(vis_image, pt, 3, color, -1, cv::LINE_AA);
-        inlier_count++;
     }
     
     // Add text information

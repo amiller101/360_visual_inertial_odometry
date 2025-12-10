@@ -116,6 +116,28 @@ public:
     PnPResult SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints = true);
     
     /**
+     * @brief PnP observation structure for snapshot-based PnP
+     */
+    struct PnPObservation {
+        cv::Point2f pixel;           // 2D pixel coordinate
+        Eigen::Vector3f world_point; // 3D world point (copied from MapPoint)
+        size_t feature_idx;          // Feature index in frame
+        bool is_marginalized;        // Whether MapPoint is marginalized
+        
+        PnPObservation(const cv::Point2f& p, const Eigen::Vector3f& wp, size_t idx, bool marg)
+            : pixel(p), world_point(wp), feature_idx(idx), is_marginalized(marg) {}
+    };
+    
+    /**
+     * @brief Solve PnP using pre-collected observations (thread-safe snapshot)
+     * @param frame Frame to optimize pose for
+     * @param observations Pre-collected observations with copied MapPoint positions
+     * @return PnP optimization result
+     */
+    PnPResult SolvePnPWithSnapshot(std::shared_ptr<Frame> frame,
+                                    const std::vector<PnPObservation>& observations);
+
+    /**
      * @brief Run Bundle Adjustment on a set of frames and their MapPoints
      * @param frames Vector of frames to optimize
      * @param fix_first_pose If true, first frame's pose is fixed

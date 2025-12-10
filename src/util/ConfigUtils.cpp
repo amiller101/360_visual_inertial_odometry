@@ -98,7 +98,7 @@ void ConfigUtils::SetDefaultValues() {
     imu_accel_noise = 0.01f;
     imu_gyro_bias_noise = 0.0001f;
     imu_accel_bias_noise = 0.001f;
-    imu_gravity_magnitude = 9.81f;
+    imu_gravity_magnitude = 9.805f;
 }
 
 bool ConfigUtils::Load(const std::string& config_file) {
