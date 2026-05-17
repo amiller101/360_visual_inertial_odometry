@@ -61,6 +61,13 @@ public:
     float tracking_min_features_ratio;
     float tracking_min_parallax_for_keyframe;
     int tracking_window_size;
+    bool tracking_filter_persistent_low_motion;
+    int tracking_low_motion_min_age;
+    float tracking_low_motion_max_flow_px;
+    /// If > 0, in VIO state create a keyframe when this many seconds elapse since the last
+    /// keyframe and PnP succeeded, even when parallax is below tracking_min_parallax_for_keyframe.
+    /// Use for low-parallax motion (straight rows). 0 disables (parallax-only keyframes).
+    float tracking_vio_time_fallback_keyframe_sec;
     
     // Initialization
     int initialization_window_size;
@@ -93,6 +100,7 @@ public:
     // Video output
     float video_output_fps;
     std::string video_output_codec;
+    int trajectory_autosave_interval_frames;
     
     // Camera extrinsics
     Eigen::Matrix4f T_BC;

@@ -51,9 +51,11 @@ venv/
 datasets/*/360-VIO_format/images/
 datasets/*/360-VIO_format/data.mp4
 datasets/*/360-VIO_format/data.jsonl
+data/**
 
 # Keep structure but ignore data
 !datasets/*/360-VIO_format/.gitkeep
+!data/.gitkeep
 
 # Logs
 *.log

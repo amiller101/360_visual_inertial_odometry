@@ -1,0 +1,142 @@
+%YAML:1.0
+---
+# ============================================================================
+# Titan-specific configuration for 360_vio_example
+#
+# Target hardware : Insta360 Titan, stitched equirectangular output
+# Native image    : 3840 x 1920 (full Titan stitched resolution)
+# Processing size : 960 x 480  (4× downscale applied by app on load)
+# IMU             : on-board, 500 Hz
+#
+# This file overrides default_config.yaml values that are inappropriate for
+# the Titan's wide-FOV ERP output, agricultural row-crop motion profile,
+# and typical on-field data-collection conditions.
+# ============================================================================
+
+camera:
+  # The app rescales every loaded image to (width × height) on load.
+  # Native Titan ERP is 3840×1920; these values apply a 4× downscale at load time.
+  # All feature distances, flow thresholds, and boundary margins in this file
+  # are in units of this working resolution (960×480), not native resolution.
+  width: 960
+  height: 480
+  # Exclude the top and bottom polar caps where the dual-lens stitch degrades
+  # and there is little scene content for a ground vehicle.
+  polar_exclusion_ratio: 0.15
+  # Pixels masked along all four borders of the working-resolution ERP:
+  #   Left / right : ERP wrap-around seam (avoids features split at ±180°)
+  #   Top  / bottom: rig cap, stitch padding, and any static physical frame
+  # At 960-wide, 20 px ≈ 7.5° of longitude / ≈ 3.75% of image height.
+  # Raise to 35-60 px if rig-body features are still being detected.
+  boundary_margin: 20
+
+# ---- Feature detection (used during normal VIO tracking) -------------------
+feature_detection:
+  max_features: 1200
+  quality_level: 0.01    # Lower than default to get more features on low-texture crops
+  min_distance: 25.0     # Tighter spacing to spread features across the wide FOV
+  grid_cols: 20
+  grid_rows: 10
+  max_features_per_grid: 8
+
+# ---- Optical flow ----------------------------------------------------------
+optical_flow:
+  window_size: 51        
+  max_level: 3
+  max_iterations: 30
+  epsilon: 0.01
+
+# ---- Rotation-only RANSAC --------------------------------------------------
+ransac:
+  max_iterations: 1000
+  threshold_degrees: 5.0
+  confidence: 0.99
+
+# ---- Tracking (post-initialisation VIO state) ------------------------------
+tracking:
+  min_features_ratio: 0.5
+  # Lowered from the 20 px default: straight crop-row motion produces little
+  # parallax vs the last keyframe even when the rover is moving.
+  min_parallax_for_keyframe: 6.0
+  window_size: 10
+
+  # Suppress rig-fixed tracks (stitch seams, physical frame edges) that survive
+  # rotation RANSAC but move < low_motion_max_flow_px px even after many frames.
+  # Automatically disabled during monocular/IMU initialisation by the estimator.
+  filter_persistent_low_motion: 1
+  # Consider reducing the strenght of this filtering to preserve features on the horizon
+  low_motion_min_age: 15          # Frames a track must be alive before it can be suppressed
+  low_motion_max_flow_px: 0.18   # Flow threshold below which a track is considered stationary
+
+  # Time-based keyframe fallback: if no parallax-based keyframe fires within
+  # this interval AND PnP succeeded, create one anyway.  Prevents the map from
+  # going stale on long straight rows.  Tune down (0.45-0.55 s) for denser
+  # keyframes, up (0.9-1.2 s) if the map feels over-constrained.
+  # Set to 0.0 to revert to purely parallax-driven keyframe creation.
+  vio_time_fallback_keyframe_sec: 0.65
+
+# ---- Initialisation --------------------------------------------------------
+# Runs on the first N frames to bootstrap monocular + IMU scale.
+# Looser than tracking to succeed on low-texture crop scenes.
+initialization:
+  window_size: 20
+  min_parallax: 12.0             # Lower than default; startup motion may be limited
+  min_features: 20
+  min_observations: 8
+  ransac_threshold: 0.001        # Relaxed threshold for 5-pt RANSAC to succeed on low-texture crops
+  ransac_iterations: 300
+  min_inlier_ratio: 0.7
+  max_reprojection_error: 8.0    # Relaxed for wide FOV reprojection
+
+  # Sparser grid during init: fewer, better-spread features aid 5-pt geometry.
+  feature_detection:
+    max_features: 1200
+    quality_level: 0.015
+    min_distance: 35.0
+    grid_cols: 10
+    grid_rows: 5
+    max_features_per_grid: 7
+
+# ---- Visualisation ---------------------------------------------------------
+visualization:
+  scale: 1.0
+  show_grid: 1
+  grid_color: [100, 255, 100]
+  grid_thickness: 1
+  max_age_for_color: 30
+  stable_age_threshold: 5
+  highlight_clustered_grid: 1
+  clustered_grid_color: [255, 100, 100]
+  clustered_std_ratio: 0.25
+
+# ---- Video / output --------------------------------------------------------
+video_output:
+  fps: 30.0
+  codec: "mp4v"
+  # Write estimated_trajectory_autosave.txt every N frames while running.
+  # Reduces data loss if the process is OOM-killed before "Finish & Save".
+  trajectory_autosave_interval_frames: 200
+
+# ---- Camera-IMU extrinsics -------------------------------------------------
+# T_BC transforms a point from camera frame to body (IMU) frame:
+#   p_body = T_BC * p_camera
+#
+# Current value: produced by sequence estimation from a recorded Titan run.
+# The translation block is zero (IMU and camera estimated as same point for now).
+# Replace with a Kalibr result if possible in the future.
+extrinsics:
+  T_BC:
+    - [0.85272885, -0.52232059, -0.00589114, 0.00000000]
+    - [0.52203493,  0.85254810, -0.02532337, 0.00000000]
+    - [0.01824939,  0.01851859,  0.99966195, 0.00000000]
+    - [0.00000000,  0.00000000,  0.00000000, 1.00000000]
+
+# ---- IMU noise model -------------------------------------------------------
+# Values are approximate; refine with Allan-variance analysis on a static log.
+imu:
+  frequency: 500.0
+  gyro_noise: 0.01
+  accel_noise: 0.01
+  gyro_bias_noise: 0.0001
+  accel_bias_noise: 0.001
+  gravity_magnitude: 9.805      # m/s² — adjust for latitude if needed

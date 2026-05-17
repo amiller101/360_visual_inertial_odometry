@@ -2065,11 +2065,22 @@ IMUInitResult Optimizer::OptimizeIMUInitWithScale(
         
         LOG_INFO("  Scale prior: {:.4f} (weight={:.2f})", scale_prior_value, scale_prior_weight);
         
-        // FIXED: All poses, Gyro bias
+        // FIXED: Poses that are actually connected in this problem, Gyro bias
+        int fixed_pose_blocks = 0;
+        int skipped_pose_blocks = 0;
         for (size_t i = 0; i < num_frames; ++i) {
-            problem.SetParameterBlockConstant(pose_params[i].data());
+            if (problem.HasParameterBlock(pose_params[i].data())) {
+                problem.SetParameterBlockConstant(pose_params[i].data());
+                fixed_pose_blocks++;
+            } else {
+                skipped_pose_blocks++;
+            }
         }
         problem.SetParameterBlockConstant(gyro_bias_params.data());  // Fixed from Stage 0
+        if (skipped_pose_blocks > 0) {
+            LOG_WARN("  Stage 3: skipped {} disconnected pose blocks (fixed {})",
+                     skipped_pose_blocks, fixed_pose_blocks);
+        }
         
         // FREE: Gravity direction, Accel bias, Scale, Velocities
         // Scale must be positive (lower bound > 0)

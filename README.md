@@ -1,9 +1,12 @@
-# 360° Visual-Inertial Odometry
+# 360° Visual-Inertial Odometry — Titan Fork
 
-A real-time Visual-Inertial Odometry (VIO) system using 360° equirectangular cameras with IMU integration.
+This is a fork of [93won/360_visual_inertial_odometry](https://github.com/93won/360_visual_inertial_odometry), extended for use with stitched equirectangular video from an **Insta360 Titan**
+in agricultural row-crop environments.
 
-![360 VIO Demo](docs/demo.gif)
+For a full description of every change made to the original codebase, see
+`[docs/Changes_Implemented.md](docs/Changes_Implemented.md)`.
 
+---
 
 ## Dependencies
 
@@ -15,55 +18,77 @@ A real-time Visual-Inertial Odometry (VIO) system using 360° equirectangular ca
 - **Pangolin** (included as submodule)
 - **spdlog** (included as submodule)
 
-## Build Instructions
-
-### 1. Clone the repository
+## Build
 
 ```bash
-git clone --recursive https://github.com/93won/360_visual_inertial_odometry.git
+git clone --recursive <your-fork-url>
 cd 360_visual_inertial_odometry
-```
-
-### 2. Build the project
-
-```bash
 ./build.sh
 ```
 
+The executable is generated at `build/bin/360_vio_example`.
 
-The executable will be generated at `build/bin/360_vio_example`.
+---
+
+## Running
+
+Pass the sequence directory and a config file explicitly:
+
+```bash
+LIBGL_ALWAYS_SOFTWARE=1 ./build/bin/360_vio_example \
+  /path/to/sequence \
+  /path/to/config/titan_config.yaml
+```
+
+`LIBGL_ALWAYS_SOFTWARE=1` prevents OpenGL crashes on headless or
+software-render systems.
+
+See `[docs/Titan_Run_Guide.md](docs/Titan_Run_Guide.md)` for the full workflow,
+including dataset layout, calibration, tuning, and output files.
+
+---
 
 ## Dataset
 
-### Original Dataset Source
+### Original benchmark
 
-The dataset is from the **360VIO** benchmark:
+The original dataset is from the **360VIO** benchmark:
 
-📄 **Paper**: [360VIO: Robust Visual-Inertial Odometry Using 360 Degree Camera](https://ieee-dataport.org/documents/360vio-robust-visual-inertial-odometry-using-360-degree-camera)
+📄 [360VIO: Robust Visual-Inertial Odometry Using 360 Degree Camera](https://ieee-dataport.org/documents/360vio-robust-visual-inertial-odometry-using-360-degree-camera)
 
-### Pre-parsed Dataset (Recommended)
+🔗 [Pre-parsed dataset (Google Drive)](https://drive.google.com/drive/folders/1Cry1wAP2cYRwB4armNdCuuae5ZyYmsxm?usp=drive_link)
 
-For convenience, we provide pre-parsed datasets ready to use:
+### Titan sequences
 
-🔗 **Google Drive**: [Download Dataset](https://drive.google.com/drive/folders/1Cry1wAP2cYRwB4armNdCuuae5ZyYmsxm?usp=drive_link)
+Expected layout for Titan data:
 
-## Running the Demo
-
-```bash
-cd build
-./bin/360_vio_example /path/to/dataset/seq1_vio/
+```
+<sequence>/
+  images/             stitched ERP frames (.jpg, .jpeg, or .png)
+  cam_timestamps.txt  one timestamp per line (seconds, monotonically increasing)
+  imu_data.csv        header + rows: timestamp,ax,ay,az,gx,gy,gz
 ```
 
-### Example
+Validate a sequence before running:
 
 ```bash
-./bin/360_vio_example /home/user/data/360/seq1_vio/
+python3 scripts/validate_titan_dataset.py /path/to/sequence
 ```
 
+---
 
+## Documentation
+
+
+| File                                                                             | Description                                          |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `[docs/Titan_Run_Guide.md](docs/Titan_Run_Guide.md)`                             | Full operator guide for Titan data                   |
+| `[docs/Titan_Calibration_Suggestions.md](docs/Titan_Calibration_Suggestions.md)` | T_BC calibration options and record template         |
+| `[docs/Changes_Implemented.md](docs/Changes_Implemented.md)`                     | All changes made relative to the upstream repository |
+
+
+---
 
 ## License
 
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.
-
-

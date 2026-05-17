@@ -1,0 +1,2 @@
+run_id,sequence_id,config_file,changed_param_group,changed_params,config_loaded,images_count,timestamps_count,imu_count,imu_hz,median_imu_per_frame,vo_init_success,vo_init_frame_pair,vo_init_attempts,imu_init_success,imu_init_kf_count,imu_init_time_s,imu_init_scale,imu_init_gravity_norm,crash_or_error,trajectory_notes
+1,,,,,,,,,,,,,,,,,,,,

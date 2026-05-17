@@ -28,13 +28,21 @@ ransac:
 
 tracking:
   min_features_ratio: 0.5
-  min_parallax_for_keyframe: 20.0  # Minimum parallax (pixels) to create new keyframe
-  window_size: 10  # Sliding window size for tracking (after initialization)
+  min_parallax_for_keyframe: 20.0  # Minimum median parallax (pixels) to trigger a new keyframe
+  window_size: 10                  # Sliding-window size after initialisation
+  # Suppress rig-fixed tracks that survive RANSAC but never move (e.g. stitch seams).
+  # Only active in VIO state; automatically disabled during monocular/IMU init.
+  filter_persistent_low_motion: 0  # Set to 1 to enable
+  low_motion_min_age: 12           # Track must be at least this many frames old
+  low_motion_max_flow_px: 0.25     # ... and move less than this many pixels to be suppressed
+  # Force a new keyframe after this many seconds even when parallax stays low.
+  # Prevents map starvation on long straight segments. 0 = parallax-only (default).
+  vio_time_fallback_keyframe_sec: 0.0
 
 initialization:
   window_size: 10
-  min_parallax: 10.0
-  min_features: 100
+  min_parallax: 20.0
+  min_features: 1000
   min_observations: 10
   ransac_threshold: 0.1  # ~6 degrees (sin(6°) ≈ 0.1)
   ransac_iterations: 200
@@ -42,11 +50,11 @@ initialization:
   max_reprojection_error: 5.0  # Maximum reprojection error in pixels
   feature_detection:
     max_features: 1000
-    quality_level: 0.01
-    min_distance: 30.0
-    grid_cols: 20
-    grid_rows: 10
-    max_features_per_grid: 10
+    quality_level: 0.02
+    min_distance: 50.0
+    grid_cols: 10
+    grid_rows: 5
+    max_features_per_grid: 5
 
 visualization:
   scale: 1.0
@@ -59,11 +67,19 @@ visualization:
   clustered_grid_color: [255, 100, 100]
   clustered_std_ratio: 0.25
 
+video_output:
+  fps: 30.0
+  codec: "mp4v"
+  # Write a recovery trajectory every N frames (0 = disabled).
+  trajectory_autosave_interval_frames: 0
+
 extrinsics:
-  T_BC: 
-    - [-0.0013741, -0.99974421, -0.02257504, 0.01065397]
-    - [-0.02183404, -0.02253969, 0.9995075, 0.00614827]
-    - [-0.99976066, 0.00186632, -0.02179749, 0.01690583]
+  # Identity: assumes camera and IMU frames are already aligned.
+  # Replace with a calibrated T_BC before use (see docs/Titan_Run_Guide.md).
+  T_BC:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
     - [0.0, 0.0, 0.0, 1.0]
 
 imu:
@@ -72,3 +88,4 @@ imu:
   accel_noise: 0.01
   gyro_bias_noise: 0.0001
   accel_bias_noise: 0.001
+  gravity_magnitude: 9.805

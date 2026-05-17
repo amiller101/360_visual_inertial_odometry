@@ -180,6 +180,7 @@ int main(int argc, char** argv) {
     auto last_frame_time = std::chrono::steady_clock::now();
     constexpr double TARGET_FPS = 30.0;
     constexpr auto TARGET_FRAME_DURATION = std::chrono::microseconds(static_cast<int>(1000000.0 / TARGET_FPS));
+    std::string autosave_path = dataset_dir + "estimated_trajectory_autosave.txt";
     
     for (size_t i = 0; i < image_files.size(); ++i) {
         if (viz->ShouldClose()) break;
@@ -225,6 +226,18 @@ int main(int argc, char** argv) {
         if (result.init_success) {
             viz->SetPaused(true);
             LOG_INFO("Initialization complete! Press 'Pause' to continue.");
+        }
+
+        // Periodic mid-run autosave.  Writes the current trajectory (all
+        // marginalized poses + sliding-window keyframes) to a fixed sidecar file
+        // every N frames so progress is not lost on OOM kills or long runs that
+        // never reach "Finish & Save".  The final authoritative save is still
+        // triggered by the viewer's "Finish & Save" button.
+        const int autosave_interval = config.trajectory_autosave_interval_frames;
+        if (autosave_interval > 0 && i > 0 &&
+            (i % static_cast<size_t>(autosave_interval) == 0)) {
+            estimator->SaveTrajectory(autosave_path);
+            LOG_INFO("Autosaved trajectory at frame {} -> {}", i, autosave_path);
         }
         
         prev_frame = current_frame;

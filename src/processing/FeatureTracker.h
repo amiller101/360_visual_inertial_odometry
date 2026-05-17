@@ -141,6 +141,11 @@ public:
         m_grid_rows = rows; 
         m_max_features_per_grid = max_per_grid; 
     }
+    /// Toggle the low-motion filter at runtime.  Pass true only when the estimator
+    /// is in VIO state; pass false during monocular/IMU initialisation.
+    void SetPersistentLowMotionFilterEnabled(bool enabled) {
+        m_filter_persistent_low_motion_runtime = enabled;
+    }
     int GetMaxFeatures() const { return m_max_features; }
     
 private:
@@ -195,6 +200,22 @@ private:
     
     // Boundary margin for ERP wrap-around
     int m_boundary_margin;                   // Margin from horizontal boundary
+    
+    // Persistent low-motion suppression
+    // Removes tracks that are both old (age >= m_low_motion_min_age) and nearly
+    // stationary (optical-flow magnitude <= m_low_motion_max_flow_px).  These are
+    // likely rig-fixed points (stitch seams, physical frame) that produce zero
+    // parallax and degrade scale/structure estimation.
+    //
+    // m_filter_persistent_low_motion         : loaded from config at construction.
+    // m_filter_persistent_low_motion_runtime : live gate, toggled by
+    //   Estimator::TrackFeatures() — disabled during monocular init so the filter
+    //   cannot reject the sparse flow needed for initialisation, enabled once VIO
+    //   state is reached.
+    bool  m_filter_persistent_low_motion;
+    bool  m_filter_persistent_low_motion_runtime;
+    int   m_low_motion_min_age;        // Minimum track age before suppression applies
+    float m_low_motion_max_flow_px;    // Maximum optical-flow magnitude (pixels) to suppress
     
     // Tracking state
     cv::Mat m_prev_image;                    // Previous image

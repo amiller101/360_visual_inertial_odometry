@@ -715,8 +715,28 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             DetectFeatures();
         }
         
-        // Parallax-based keyframe creation (after IMU init)
-        if (ShouldCreateKeyframe()) {
+        // Keyframe creation in VIO state uses two criteria:
+        //  1. Parallax-based (ShouldCreateKeyframe) — fires whenever median pixel
+        //     parallax vs the last keyframe exceeds the configured threshold.
+        //  2. Time fallback — fires when (1) has not triggered for
+        //     tracking_vio_time_fallback_keyframe_sec seconds and PnP succeeded.
+        //     Keeps the sliding-window map fresh on long straight segments where
+        //     parallax stays low (e.g. crop rows), preventing drift accumulation.
+        bool create_keyframe = ShouldCreateKeyframe();
+        if (!create_keyframe && result.success && m_last_keyframe) {
+            const float fallback_sec =
+                ConfigUtils::GetInstance().tracking_vio_time_fallback_keyframe_sec;
+            if (fallback_sec > 1e-6f) {
+                const double dt_since_kf =
+                    m_current_frame->GetTimestamp() - m_last_keyframe->GetTimestamp();
+                if (dt_since_kf >= static_cast<double>(fallback_sec)) {
+                    create_keyframe = true;
+                    LOG_DEBUG("VIO time-fallback keyframe: {:.3f}s since last KF",
+                              dt_since_kf);
+                }
+            }
+        }
+        if (create_keyframe) {
             CreateKeyframe();
         }
         
@@ -957,6 +977,11 @@ int Estimator::TrackFeatures() {
     if (!m_previous_frame || !m_current_frame) {
         return 0;
     }
+    
+    // Avoid suppressing low-flow tracks during monocular initialization;
+    // enable only in full VIO state where rig-static tracks become harmful.
+    m_feature_tracker->SetPersistentLowMotionFilterEnabled(
+        m_tracking_state == TrackingState::VIO);
     
     // Track features using feature tracker
     m_feature_tracker->TrackFeatures(m_current_frame, m_previous_frame);

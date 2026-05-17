@@ -15,6 +15,7 @@
 #include "Feature.h"
 #include "Frame.h"
 #include "ConfigUtils.h"
+#include "Logger.h"
 #include <algorithm>
 #include <random>
 #include <cmath>
@@ -40,9 +41,22 @@ FeatureTracker::FeatureTracker(std::shared_ptr<Camera> camera,
       m_grid_rows(10),
       m_max_features_per_grid(4),
       m_boundary_margin(boundary_margin),
+      m_filter_persistent_low_motion(false),
+      m_filter_persistent_low_motion_runtime(false),
+      m_low_motion_min_age(12),
+      m_low_motion_max_flow_px(0.25f),
       m_next_feature_id(0),
       m_num_tracked(0),
       m_num_detected(0) {
+    // Load low-motion filter settings from config.
+    // m_filter_persistent_low_motion stores the config-time value so it can be
+    // restored; m_filter_persistent_low_motion_runtime is the live gate toggled
+    // per-frame by Estimator (disabled during monocular init, enabled in VIO).
+    const auto& cfg = ConfigUtils::GetInstance();
+    m_filter_persistent_low_motion         = cfg.tracking_filter_persistent_low_motion;
+    m_filter_persistent_low_motion_runtime = cfg.tracking_filter_persistent_low_motion;
+    m_low_motion_min_age                   = cfg.tracking_low_motion_min_age;
+    m_low_motion_max_flow_px               = cfg.tracking_low_motion_max_flow_px;
     
     // Create polar region mask
     m_polar_mask = m_camera->CreatePolarMask();
@@ -53,8 +67,12 @@ FeatureTracker::FeatureTracker(std::shared_ptr<Camera> camera,
         // Left boundary (0 to margin)
         m_boundary_mask(cv::Rect(0, 0, m_boundary_margin, m_camera->GetHeight())) = 0;
         // Right boundary (width-margin to width)
-        m_boundary_mask(cv::Rect(m_camera->GetWidth() - m_boundary_margin, 0, 
+        m_boundary_mask(cv::Rect(m_camera->GetWidth() - m_boundary_margin, 0,
                                   m_boundary_margin, m_camera->GetHeight())) = 0;
+        // Top and bottom (rig cap / stitch padding / static frame on ERP)
+        m_boundary_mask(cv::Rect(0, 0, m_camera->GetWidth(), m_boundary_margin)) = 0;
+        m_boundary_mask(cv::Rect(0, m_camera->GetHeight() - m_boundary_margin,
+                                 m_camera->GetWidth(), m_boundary_margin)) = 0;
     }
 }
 
@@ -136,9 +154,24 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     // Create features from inliers
     int current_feature_index = 0;
     int total_observations = 0;
+    int low_motion_filtered = 0;
     for (size_t i = 0; i < inlier_mask.size(); ++i) {
         if (inlier_mask[i]) {
             auto prev_feature = good_prev_features[i];
+
+            if (m_filter_persistent_low_motion_runtime) {
+                const cv::Point2f& p0 = good_prev_points[i];
+                const cv::Point2f& p1 = good_curr_points[i];
+                float dx = p1.x - p0.x;
+                float dy = p1.y - p0.y;
+                float flow = std::sqrt(dx * dx + dy * dy);
+                if (prev_feature->GetAge() >= m_low_motion_min_age &&
+                    flow <= m_low_motion_max_flow_px) {
+                    low_motion_filtered++;
+                    continue;
+                }
+            }
+
             auto feature = std::make_shared<Feature>(prev_feature->GetFeatureId(), 
                                                      good_curr_points[i]);
             
@@ -163,6 +196,10 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     }
     
     m_num_tracked = static_cast<int>(current_frame->GetFeatureCount());
+    if (m_filter_persistent_low_motion_runtime && low_motion_filtered > 0) {
+        LOG_DEBUG("Filtered {} persistent low-motion tracks (age>={}, flow<={:.3f}px)",
+                  low_motion_filtered, m_low_motion_min_age, m_low_motion_max_flow_px);
+    }
     
     // Remove clustered features before grid assignment
     RemoveClusteredFeatures(current_frame);

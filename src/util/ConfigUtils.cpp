@@ -56,23 +56,27 @@ void ConfigUtils::SetDefaultValues() {
     tracking_min_features_ratio = 0.5f;
     tracking_min_parallax_for_keyframe = 20.0f;
     tracking_window_size = 5;
+    tracking_filter_persistent_low_motion = false;
+    tracking_low_motion_min_age = 12;
+    tracking_low_motion_max_flow_px = 0.25f;
+    tracking_vio_time_fallback_keyframe_sec = 0.0f;
     
     // Initialization
     initialization_window_size = 20;
-    initialization_min_parallax = 10.0f;
-    initialization_min_features = 50;
+    initialization_min_parallax = 20.0f;
+    initialization_min_features = 14;
     initialization_min_observations = 10;
     initialization_ransac_threshold = 0.001f;
     initialization_ransac_iterations = 200;
     initialization_min_inlier_ratio = 0.7f;
-    initialization_max_reprojection_error = 2.0f;
+    initialization_max_reprojection_error = 8.0f;
     // Initialization feature detection (defaults same as tracking)
     initialization_max_features = 1000;
-    initialization_quality_level = 0.01;
-    initialization_min_distance = 30.0;
-    initialization_grid_cols = 20;
-    initialization_grid_rows = 10;
-    initialization_max_features_per_grid = 10;
+    initialization_quality_level = 0.02;
+    initialization_min_distance = 50.0;
+    initialization_grid_cols = 10;
+    initialization_grid_rows = 5;
+    initialization_max_features_per_grid = 5;
     
     // Visualization
     visualization_scale = 1.0f;
@@ -88,6 +92,7 @@ void ConfigUtils::SetDefaultValues() {
     // Video output
     video_output_fps = 30.0f;
     video_output_codec = "mp4v";
+    trajectory_autosave_interval_frames = 200;
     
     // Camera extrinsics (identity by default)
     T_BC = Eigen::Matrix4f::Identity();
@@ -155,6 +160,21 @@ bool ConfigUtils::Load(const std::string& config_file) {
         }
         if (!tracking["window_size"].empty()) {
             tracking_window_size = (int)tracking["window_size"];
+        }
+        if (!tracking["filter_persistent_low_motion"].empty()) {
+            tracking_filter_persistent_low_motion =
+                (int)tracking["filter_persistent_low_motion"] != 0;
+        }
+        if (!tracking["low_motion_min_age"].empty()) {
+            tracking_low_motion_min_age = (int)tracking["low_motion_min_age"];
+        }
+        if (!tracking["low_motion_max_flow_px"].empty()) {
+            tracking_low_motion_max_flow_px =
+                (float)(double)tracking["low_motion_max_flow_px"];
+        }
+        if (!tracking["vio_time_fallback_keyframe_sec"].empty()) {
+            tracking_vio_time_fallback_keyframe_sec =
+                (float)(double)tracking["vio_time_fallback_keyframe_sec"];
         }
     }
     
@@ -228,6 +248,9 @@ bool ConfigUtils::Load(const std::string& config_file) {
     if (!video_output.empty()) {
         video_output_fps = (float)(double)video_output["fps"];
         video_output_codec = (std::string)video_output["codec"];
+        if (!video_output["trajectory_autosave_interval_frames"].empty()) {
+            trajectory_autosave_interval_frames = (int)video_output["trajectory_autosave_interval_frames"];
+        }
     }
     
     // Camera extrinsics
