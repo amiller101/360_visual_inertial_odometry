@@ -1,10 +1,10 @@
 # 360° Visual-Inertial Odometry — Titan Fork
 
-This is a fork of [93won/360_visual_inertial_odometry](https://github.com/93won/360_visual_inertial_odometry), extended for use with stitched equirectangular video from an **Insta360 Titan**
-in agricultural row-crop environments.
+This is a fork of [93won/360_visual_inertial_odometry](https://github.com/93won/360_visual_inertial_odometry), extended for use with 360° video from an **Insta360 Titan**
+in agricultural, row-crop environments.
 
 For a full description of every change made to the original codebase, see
-`[docs/Changes_Implemented.md](docs/Changes_Implemented.md)`.
+[docs/Changes_Implemented.md](docs/Changes_Implemented.md).
 
 ---
 
@@ -43,7 +43,7 @@ LIBGL_ALWAYS_SOFTWARE=1 ./build/bin/360_vio_example \
 `LIBGL_ALWAYS_SOFTWARE=1` prevents OpenGL crashes on headless or
 software-render systems.
 
-See `[docs/Titan_Run_Guide.md](docs/Titan_Run_Guide.md)` for the full workflow,
+See [docs/Titan_Run_Guide.md](docs/Titan_Run_Guide.md) for the full workflow,
 including dataset layout, calibration, tuning, and output files.
 
 ---
@@ -82,9 +82,9 @@ python3 scripts/validate_titan_dataset.py /path/to/sequence
 
 | File                                                                             | Description                                          |
 | -------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| `[docs/Titan_Run_Guide.md](docs/Titan_Run_Guide.md)`                             | Full operator guide for Titan data                   |
-| `[docs/Titan_Calibration_Suggestions.md](docs/Titan_Calibration_Suggestions.md)` | T_BC calibration options and record template         |
-| `[docs/Changes_Implemented.md](docs/Changes_Implemented.md)`                     | All changes made relative to the upstream repository |
+| [docs/Titan_Run_Guide.md](docs/Titan_Run_Guide.md)                            | Full operator guide for Titan data                   |
+| [docs/Titan_Calibration_Suggestions.md](docs/Titan_Calibration_Suggestions.md) | T_BC calibration options and record template         |
+| [docs/Changes_Implemented.md](docs/Changes_Implemented.md)                    | All changes made relative to the upstream repository |
 
 
 ---
