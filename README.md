@@ -1,7 +1,7 @@
 # 360° Visual-Inertial Odometry — Titan Fork
 
 This is a fork of [93won/360_visual_inertial_odometry](https://github.com/93won/360_visual_inertial_odometry), extended for use with 360° video from an **Insta360 Titan**
-in agricultural, row-crop environments.
+in monotonic agricultural row-crop environments. Adds Titan config, row-crop keyframe tuning, IMU init fixes, and trajectory autosave.
 
 For a full description of every change made to the original codebase, see
 [docs/Changes_Implemented.md](docs/Changes_Implemented.md).
