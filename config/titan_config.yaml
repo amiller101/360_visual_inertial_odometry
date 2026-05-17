@@ -25,7 +25,7 @@ camera:
   polar_exclusion_ratio: 0.15
   # Pixels masked along all four borders of the working-resolution ERP:
   #   Left / right : ERP wrap-around seam (avoids features split at ±180°)
-  #   Top  / bottom: rig cap, stitch padding, and any static physical frame
+  #   Top  / bottom: polar region — weakest sensor coverage and most severe fisheye distortion
   # At 960-wide, 20 px ≈ 7.5° of longitude / ≈ 3.75% of image height.
   # Raise to 35-60 px if rig-body features are still being detected.
   boundary_margin: 20
@@ -60,7 +60,7 @@ tracking:
   min_parallax_for_keyframe: 6.0
   window_size: 10
 
-  # Suppress rig-fixed tracks (stitch seams, physical frame edges) that survive
+  # Suppress near-stationary tracks (e.g. very distant or degenerate features) that survive
   # rotation RANSAC but move < low_motion_max_flow_px px even after many frames.
   # Automatically disabled during monocular/IMU initialisation by the estimator.
   filter_persistent_low_motion: 1
@@ -126,10 +126,11 @@ video_output:
 # Replace with a Kalibr result if possible in the future.
 extrinsics:
   T_BC:
-    - [0.85272885, -0.52232059, -0.00589114, 0.00000000]
-    - [0.52203493,  0.85254810, -0.02532337, 0.00000000]
-    - [0.01824939,  0.01851859,  0.99966195, 0.00000000]
-    - [0.00000000,  0.00000000,  0.00000000, 1.00000000]
+    - [0.98698205, -0.16075029, -0.00507781, 0.00000000]
+    - [0.16066670, 0.98690993, -0.01396420, 0.00000000]
+    - [0.00725609, 0.01296658, 0.99988960, 0.00000000]
+    - [0.00000000, 0.00000000, 0.00000000, 1.00000000]
+
 
 # ---- IMU noise model -------------------------------------------------------
 # Values are approximate; refine with Allan-variance analysis on a static log.

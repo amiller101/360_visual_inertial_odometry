@@ -36,10 +36,11 @@ if (problem.HasParameterBlock(pose_params[i].data())) {
 ### 1. Top and bottom boundary masking
 
 **Problem:** The original boundary mask only excluded the left and right edges of
-the ERP frame (wrap-around seam).  On Titan output, the top and bottom rows
-contain the rig cap, stitch padding, and often a static physical frame edge.
-Features detected there have near-zero parallax and contaminate the rotation
-RANSAC and parallax measurements.
+the ERP frame (wrap-around seam).  On multi-sensor ERP output such as the Titan,
+the top and bottom rows correspond to the polar regions of the sphere where the
+sensor coverage is weakest and fisheye distortion is most severe.  Features
+detected there are geometrically unreliable and produce noisy optical flow that
+contaminates rotation RANSAC and parallax measurements.
 
 **Fix:** Extended the boundary mask to also zero out `boundary_margin` pixels
 along the top and bottom of the frame.  Controlled by the existing
@@ -153,7 +154,7 @@ differences from the default:
 | `tracking.filter_persistent_low_motion` | 0 | 1 | Removes rig/seam fixed tracks |
 | `tracking.low_motion_min_age` | 12 | 15 | Tuned for Titan track lifetime |
 | `tracking.low_motion_max_flow_px` | 0.25 | 0.18 | Tighter threshold for ERP at this resolution |
-| `camera.boundary_margin` | 20 | 20 | Masks ERP seam and rig cap |
+| `camera.boundary_margin` | 20 | 20 | Masks ERP seam and polar distortion zone |
 | `initialization.min_parallax` | 20.0 | 12.0 | Looser for low-excitation startup |
 | `initialization.min_features` | 1000 | 20 | Looser for agricultural scenes |
 | `initialization.max_reprojection_error` | 5.0 | 8.0 | Relaxed for ERP reprojection units |

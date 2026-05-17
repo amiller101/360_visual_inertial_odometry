@@ -168,8 +168,8 @@ Features are suppressed in four border regions controlled by
 
 - **Left / right**: ERP wrap-around seam — features here split across the
 discontinuity and produce spurious flow.
-- **Top / bottom**: rig cap, stitch padding, and any static physical frame
-visible in the Titan output.
+- **Top / bottom**: polar regions where sensor coverage is weakest and fisheye
+  distortion is most severe, producing geometrically unreliable features.
 
 If corner features are still detected on the physical rig body, raise
 `camera.boundary_margin` to 35–60 px.
